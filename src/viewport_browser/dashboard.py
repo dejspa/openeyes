@@ -151,6 +151,7 @@ function ofs(id){
 }
 function xfs(){fid=null;document.getElementById('fs').classList.remove('on');document.onkeydown=null;document.onkeyup=null;}
 function ctab(id){
+  if(!confirm('Close this tab?'))return;
   fetch('/api/close/'+id,{method:'POST'}).then(()=>{
     const s=S[id];if(s&&s.ws)s.ws.close();
     delete S[id];rt(id);
