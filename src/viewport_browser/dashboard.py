@@ -172,6 +172,15 @@ setInterval(poll,2000);poll();
 
 
 class _HTTPHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress request logs
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except BrokenPipeError:
+            pass  # Browser closed connection early — harmless
+
     def do_GET(self):
         if self.path == '/' or self.path == '/index.html':
             body = _HTML.encode()
