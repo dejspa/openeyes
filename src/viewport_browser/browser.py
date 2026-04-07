@@ -117,7 +117,7 @@ _CLICK_SNAP_JS = """
 
 
 class BrowserManager:
-    """Manages a Chromium instance with one active page.
+    """Manages a Chromium instance with multiple tabs.
 
     Environment variables:
         HEADED=1        — show the browser window on the desktop
@@ -131,7 +131,9 @@ class BrowserManager:
         self._pw = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
-        self._page: Page | None = None
+        self._pages: list[Page] = []
+        self._active: int = 0
+        self._expect_new_page = False
         self._chrome_proc: subprocess.Popen | None = None
         self._vw = viewport_width
         self._vh = viewport_height
@@ -140,8 +142,8 @@ class BrowserManager:
         self._slow_mo = slow_mo
 
     async def _ensure_browser(self) -> Page:
-        if self._page is not None:
-            return self._page
+        if self._pages:
+            return self._pages[self._active]
 
         headed = self._headed
         slow_mo = self._slow_mo
@@ -218,8 +220,10 @@ class BrowserManager:
                 )
             # Use existing page or create one
             pages = self._context.pages
-            self._page = pages[0] if pages else await self._context.new_page()
-            await self._page.set_viewport_size({"width": self._vw, "height": self._vh})
+            page = pages[0] if pages else await self._context.new_page()
+            await page.set_viewport_size({"width": self._vw, "height": self._vh})
+            self._pages = [page]
+            self._active = 0
 
             # Auto-close popup tabs (ads, new windows from link clicks)
             self._context.on("page", self._on_new_page)
@@ -236,13 +240,17 @@ class BrowserManager:
                 viewport={"width": self._vw, "height": self._vh},
                 user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
-            self._page = await self._context.new_page()
+            page = await self._context.new_page()
+            self._pages = [page]
+            self._active = 0
             self._context.on("page", self._on_new_page)
 
-        return self._page
+        return self._pages[self._active]
 
     def _on_new_page(self, page) -> None:
-        """Auto-close popup tabs opened by ads or target=_blank links."""
+        """Auto-close popup tabs unless opened intentionally via new_tab()."""
+        if self._expect_new_page:
+            return  # Intentional — will be managed by new_tab()
         async def _close():
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=3000)
@@ -258,11 +266,53 @@ class BrowserManager:
 
     @property
     def current_url(self) -> str:
-        return self._page.url if self._page else "about:blank"
+        if not self._pages:
+            return "about:blank"
+        return self._pages[self._active].url
 
     @property
     def viewport_size(self) -> tuple[int, int]:
         return (self._vw, self._vh)
+
+    # --- Tab management ---
+
+    async def new_tab(self, url: str = "about:blank") -> int:
+        """Open a new tab. Returns the new tab's index."""
+        await self._ensure_browser()
+        self._expect_new_page = True
+        page = await self._context.new_page()
+        self._expect_new_page = False
+        await page.set_viewport_size({"width": self._vw, "height": self._vh})
+        self._pages.append(page)
+        self._active = len(self._pages) - 1
+        if url and url != "about:blank":
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await _human_delay(300, 700)
+        return self._active
+
+    async def switch_tab(self, index: int) -> None:
+        """Switch to tab by index."""
+        if 0 <= index < len(self._pages):
+            self._active = index
+            await self._pages[index].bring_to_front()
+
+    def list_tabs(self) -> list[dict]:
+        """List all open tabs with index, url, and active status."""
+        return [
+            {"index": i, "url": p.url, "active": i == self._active}
+            for i, p in enumerate(self._pages)
+        ]
+
+    async def close_tab(self, index: int) -> None:
+        """Close a tab. Won't close the last remaining tab."""
+        if len(self._pages) <= 1:
+            return
+        page = self._pages.pop(index)
+        await page.close()
+        if self._active >= len(self._pages):
+            self._active = len(self._pages) - 1
+
+    # --- Navigation ---
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
         page = await self._ensure_browser()
@@ -376,7 +426,8 @@ class BrowserManager:
             self._xvfb_proc = None
         if self._pw:
             await self._pw.stop()
-        self._page = None
+        self._pages = []
+        self._active = 0
         self._context = None
         self._browser = None
         self._pw = None

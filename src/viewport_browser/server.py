@@ -14,13 +14,17 @@ mcp = FastMCP(
 Vision-first web browser for navigating websites.
 
 TOOLS:
-- navigate(url) — go to a URL
+- navigate(url) — go to a URL in the current tab
 - click(x, y) — click at pixel coordinates on the screenshot (auto-snaps to nearest element)
 - type_text(text, press_enter, clear_first) — type into focused element
 - scroll(direction) — scroll up/down
 - get_text() — extract page text (article content, product details, prices)
 - go_back() — browser back
 - screenshot() — fresh screenshot
+- new_tab(url) — open a new tab (keeps existing tabs open)
+- switch_tab(index) — switch to a tab by index
+- list_tabs() — show all open tabs
+- close_tab(index) — close a tab
 
 HOW CLICKING WORKS:
 - Look at the screenshot and estimate the (x, y) pixel coordinates of what you want to click.
@@ -270,6 +274,53 @@ async def screenshot() -> list:
     # Always full screenshot when explicitly requested
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"{context}\n\nURL: {browser.current_url}")
+    return result
+
+
+@mcp.tool()
+async def new_tab(url: str = "about:blank") -> list:
+    """Open a new browser tab. Keeps all existing tabs open.
+    Returns a screenshot of the new tab."""
+    browser = await _get_browser()
+    index = await browser.new_tab(url)
+    img, crop, context, _ = await _capture()
+    tabs = browser.list_tabs()
+    tab_info = "\n".join(f"  [{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
+    result = [MCPImage(data=img, format="jpeg")]
+    result.append(f"{context}\n\nOpened tab {index} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}")
+    return result
+
+
+@mcp.tool()
+async def switch_tab(index: int) -> list:
+    """Switch to a different tab by index. Use list_tabs() to see available tabs."""
+    browser = await _get_browser()
+    await browser.switch_tab(index)
+    img, crop, context, _ = await _capture()
+    result = [MCPImage(data=img, format="jpeg")]
+    result.append(f"Switched to tab {index} | URL: {browser.current_url}")
+    return result
+
+
+@mcp.tool()
+async def list_tabs() -> str:
+    """List all open browser tabs."""
+    browser = await _get_browser()
+    tabs = browser.list_tabs()
+    lines = [f"[{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs]
+    return f"{len(tabs)} open tabs:\n" + "\n".join(lines)
+
+
+@mcp.tool()
+async def close_tab(index: int) -> list:
+    """Close a tab by index. Cannot close the last remaining tab."""
+    browser = await _get_browser()
+    await browser.close_tab(index)
+    img, crop, context, _ = await _capture()
+    tabs = browser.list_tabs()
+    tab_info = "\n".join(f"  [{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
+    result = [MCPImage(data=img, format="jpeg")]
+    result.append(f"Closed tab {index}\n\nAll tabs:\n{tab_info}")
     return result
 
 
