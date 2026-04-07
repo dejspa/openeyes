@@ -331,7 +331,9 @@ async def close_tab(index: int) -> list:
 
 
 def main():
-    mcp.run(transport="stdio")
+    import sys
+    transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

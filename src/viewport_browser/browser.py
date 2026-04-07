@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -151,6 +152,11 @@ class BrowserManager:
         cdp_port = self._cdp_port
 
         self._pw = await async_playwright().start()
+
+        # CDP mode requires Xvfb — skip if not available (e.g. remote/cloud hosts)
+        if cdp_port and not shutil.which("Xvfb"):
+            print("[viewport] Xvfb not found — falling back to headless mode (no dashboard)", file=sys.stderr)
+            cdp_port = None
 
         if cdp_port:
             # Launch full Chromium (not headless shell) with CDP port, then connect
