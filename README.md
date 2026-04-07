@@ -32,15 +32,45 @@ The only DOM interaction is a single `elementFromPoint()` call at click time. It
 ViewPort includes a live dashboard. Watch your agents browse in real-time from any browser:
 
 ```bash
-viewport-dashboard  # opens http://localhost:6080
+# With uv
+uv run --directory /path/to/viewport-browser viewport-dashboard
+
+# Or if installed in venv
+viewport-dashboard
 ```
 
-Uses Chrome DevTools Protocol screencast — works on headless servers, no display needed.
+Opens at **http://localhost:6080** — also accessible from other machines on the network via the host IP.
+
+Uses Chrome DevTools Protocol screencast — works on headless servers, no physical display needed.
+
+## Prerequisites
+
+- **Python 3.11+**
+- **uv** (recommended) or pip
+- **Xvfb** — required for dashboard/screencast (falls back to `--headless=new` without it)
+
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install Xvfb (Linux)
+sudo apt install xvfb        # Debian/Ubuntu
+sudo dnf install xorg-x11-server-Xvfb  # Fedora/RHEL
+```
 
 ## Setup
 
 ```bash
-git clone https://github.com/user/viewport-browser
+git clone https://github.com/dejspa/viewport-browser
+cd viewport-browser
+uv sync
+uv run playwright install chromium
+```
+
+Or with pip:
+
+```bash
+git clone https://github.com/dejspa/viewport-browser
 cd viewport-browser
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
@@ -49,20 +79,36 @@ playwright install chromium
 
 ## Connect to your agent
 
+### Claude Code / Cursor (stdio)
+
 Add to `.mcp.json` in your project root:
 
 ```json
 {
   "mcpServers": {
     "viewport": {
-      "command": "/path/to/viewport-browser/.venv/bin/python",
-      "args": ["-m", "viewport_browser.server"]
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/viewport-browser", "viewport-browser"]
     }
   }
 }
 ```
 
-Works with Claude Code, Claude Desktop, and any MCP-compatible agent. The 7 tools appear automatically after restart.
+### OpenClaw (SSE)
+
+```bash
+# Start the server
+viewport-browser sse  # listens on port 6090
+
+# Connect OpenClaw
+openclaw mcp set viewport '{"url":"http://localhost:6090/sse"}'
+```
+
+### Other platforms
+
+See [SKILL.md](SKILL.md) for integration with Paperclip, Codex CLI, Gemini CLI, and other agent harnesses.
+
+Works with any MCP-compatible agent. The 11 tools appear automatically after connecting.
 
 ## Tools
 
