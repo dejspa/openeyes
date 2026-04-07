@@ -333,6 +333,9 @@ async def close_tab(index: int) -> list:
 def main():
     import sys
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+    if transport != "stdio":
+        import os
+        os.environ.setdefault("FASTMCP_PORT", "6090")
     mcp.run(transport=transport)
 
 

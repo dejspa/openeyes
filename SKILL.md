@@ -33,13 +33,13 @@ The browser runs as an MCP server. Connect using one of these methods:
 Start the server first, then connect:
 
 ```bash
-# Start viewport-browser in SSE mode
+# Start viewport-browser in SSE mode (default port 6090)
 viewport-browser sse
 ```
 
 ```bash
 # OpenClaw
-openclaw mcp set viewport '{"url":"http://localhost:8000/sse"}'
+openclaw mcp set viewport '{"url":"http://localhost:6090/sse"}'
 ```
 
 ### Stdio with Python (if viewport-browser is not in PATH)
