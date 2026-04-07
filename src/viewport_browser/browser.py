@@ -134,6 +134,7 @@ class BrowserManager:
         self._pages: list[Page] = []
         self._active: int = 0
         self._expect_new_page = False
+        self._pins: dict[int, str] = {}  # page id -> pin name
         self._chrome_proc: subprocess.Popen | None = None
         self._vw = viewport_width
         self._vh = viewport_height
@@ -276,8 +277,23 @@ class BrowserManager:
 
     # --- Tab management ---
 
-    async def new_tab(self, url: str = "about:blank") -> int:
-        """Open a new tab. Returns the new tab's index."""
+    def _find_tab_by_keyword(self, keyword: str) -> int | None:
+        """Find an open tab whose URL or pin name matches a keyword."""
+        kw = keyword.lower()
+        # Check pinned names first (exact match)
+        for i, page in enumerate(self._pages):
+            pin = self._pins.get(id(page), "")
+            if pin and kw == pin.lower():
+                return i
+        # Then check URL domain/path contains keyword
+        for i, page in enumerate(self._pages):
+            if kw in page.url.lower():
+                return i
+        return None
+
+    async def new_tab(self, url: str = "about:blank", pin: str = "") -> int:
+        """Open a new tab. Optional pin name makes it findable by keyword
+        and protects it from close_tab. Returns the new tab's index."""
         await self._ensure_browser()
         self._expect_new_page = True
         page = await self._context.new_page()
@@ -285,6 +301,8 @@ class BrowserManager:
         await page.set_viewport_size({"width": self._vw, "height": self._vh})
         self._pages.append(page)
         self._active = len(self._pages) - 1
+        if pin:
+            self._pins[id(page)] = pin
         if url and url != "about:blank":
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _human_delay(300, 700)
@@ -297,27 +315,61 @@ class BrowserManager:
             await self._pages[index].bring_to_front()
 
     def list_tabs(self) -> list[dict]:
-        """List all open tabs with index, url, and active status."""
+        """List all open tabs with index, url, pin name, and active status."""
         return [
-            {"index": i, "url": p.url, "active": i == self._active}
+            {
+                "index": i,
+                "url": p.url,
+                "pin": self._pins.get(id(p), ""),
+                "active": i == self._active,
+            }
             for i, p in enumerate(self._pages)
         ]
 
-    async def close_tab(self, index: int) -> None:
-        """Close a tab. Won't close the last remaining tab."""
+    async def close_tab(self, index: int) -> str | None:
+        """Close a tab. Won't close pinned tabs or the last remaining tab.
+        Returns error message if refused, None on success."""
         if len(self._pages) <= 1:
-            return
-        page = self._pages.pop(index)
+            return "Cannot close the last tab"
+        page = self._pages[index]
+        pin = self._pins.get(id(page))
+        if pin:
+            return f"Tab '{pin}' is pinned — unpin it first or use navigate() to change its page"
+        self._pages.pop(index)
+        self._pins.pop(id(page), None)
         await page.close()
         if self._active >= len(self._pages):
             self._active = len(self._pages) - 1
+        return None
 
-    # --- Navigation ---
+    # --- Navigation (tab-aware) ---
 
-    async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
-        page = await self._ensure_browser()
+    async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> str:
+        """Navigate to a URL. If a tab with a matching domain is already open,
+        switches to it instead of navigating away from the current tab.
+        Full URLs (with path) always navigate in the current tab.
+        Returns a status string describing what happened."""
+        await self._ensure_browser()
+
+        # Short keyword or domain-only? Try to find existing tab.
+        is_full_url = "/" in url.split("//", 1)[-1]  # has a path beyond domain
+        keyword = url.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
+
+        if not is_full_url:
+            existing = self._find_tab_by_keyword(keyword)
+            if existing is not None:
+                self._active = existing
+                await self._pages[existing].bring_to_front()
+                return f"Switched to existing tab {existing}"
+
+        # Ensure url has protocol
+        if not url.startswith("http"):
+            url = f"https://{url}"
+
+        page = self._pages[self._active]
         await page.goto(url, wait_until=wait_until, timeout=30000)
         await _human_delay(300, 700)
+        return "Navigated"
 
     async def screenshot_bytes(self) -> bytes:
         """Capture viewport-only screenshot as PNG bytes."""
@@ -428,6 +480,7 @@ class BrowserManager:
             await self._pw.stop()
         self._pages = []
         self._active = 0
+        self._pins = {}
         self._context = None
         self._browser = None
         self._pw = None

@@ -160,14 +160,17 @@ def _build_response(img: bytes, crop: bytes | None, context: str,
 
 @mcp.tool()
 async def navigate(url: str) -> list:
-    """Navigate to a URL. Returns a screenshot."""
+    """Navigate to a URL. If a tab with that domain is already open, switches to it
+    instead of navigating away. Use full URLs (with path) to navigate in the current tab.
+    Examples: navigate("linkedin") → switches to LinkedIn tab. navigate("https://di.se/article/...") → opens in current tab."""
     browser = await _get_browser()
-    await browser.navigate(url)
+    status = await browser.navigate(url)
     img, crop, context, _ = await _capture()
     title = await browser.get_page_title()
-    # Always send full screenshot for new page
     result = [MCPImage(data=img, format="jpeg")]
-    text = f"{context}\n\nURL: {browser.current_url}\nTitle: {title}"
+    tabs = browser.list_tabs()
+    tab_info = " | ".join(f"[{t['index']}{'*' if t['active'] else ''}]{' 📌'+t['pin'] if t['pin'] else ''} {t['url'][:30]}" for t in tabs)
+    text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}\nTabs: {tab_info}"
     result.append(text)
     return result
 
@@ -278,16 +281,17 @@ async def screenshot() -> list:
 
 
 @mcp.tool()
-async def new_tab(url: str = "about:blank") -> list:
-    """Open a new browser tab. Keeps all existing tabs open.
-    Returns a screenshot of the new tab."""
+async def new_tab(url: str = "about:blank", pin: str = "") -> list:
+    """Open a new browser tab. Set pin="name" to make it findable by keyword
+    and protect it from being closed. Example: new_tab("https://linkedin.com", pin="linkedin")"""
     browser = await _get_browser()
-    index = await browser.new_tab(url)
+    index = await browser.new_tab(url, pin=pin)
     img, crop, context, _ = await _capture()
     tabs = browser.list_tabs()
-    tab_info = "\n".join(f"  [{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
+    tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
     result = [MCPImage(data=img, format="jpeg")]
-    result.append(f"{context}\n\nOpened tab {index} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}")
+    pin_msg = f" (pinned as '{pin}')" if pin else ""
+    result.append(f"{context}\n\nOpened tab {index}{pin_msg} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}")
     return result
 
 
@@ -313,12 +317,14 @@ async def list_tabs() -> str:
 
 @mcp.tool()
 async def close_tab(index: int) -> list:
-    """Close a tab by index. Cannot close the last remaining tab."""
+    """Close a tab by index. Cannot close pinned tabs or the last remaining tab."""
     browser = await _get_browser()
-    await browser.close_tab(index)
+    error = await browser.close_tab(index)
+    if error:
+        return [f"Cannot close tab {index}: {error}"]
     img, crop, context, _ = await _capture()
     tabs = browser.list_tabs()
-    tab_info = "\n".join(f"  [{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
+    tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Closed tab {index}\n\nAll tabs:\n{tab_info}")
     return result
