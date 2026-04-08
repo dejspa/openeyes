@@ -58,7 +58,7 @@ def overlay_coordinate_reference(img: Image.Image) -> Image.Image:
     return annotated
 
 
-def image_to_bytes(img: Image.Image, fmt: str = "JPEG", quality: int = 55) -> bytes:
+def image_to_bytes(img: Image.Image, fmt: str = "JPEG", quality: int = 75) -> bytes:
     """Encode image to raw bytes."""
     buf = io.BytesIO()
     if fmt == "JPEG":
@@ -132,7 +132,7 @@ def crop_region(img: Image.Image, bbox: dict, padding: int = 50) -> Image.Image:
 class VisionPipeline:
     """Processes desktop screenshots for efficient LLM consumption.
 
-    Downscales to max 896x672, JPEG quality 55.
+    Downscales to max 896x672, JPEG quality 75.
     Adds coordinate tick marks along edges.
     Tracks changes between screenshots.
     """

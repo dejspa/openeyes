@@ -110,27 +110,11 @@ Write-Output "READY"
 """
 
 # Command templates sent to the persistent process
-_PS_SCREENSHOT = r"""
-$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-$bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-$bmp.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
-$g.Dispose(); $bmp.Dispose()
-Write-Output "$($b.Width)x$($b.Height)"
-"""
+_PS_SCREENSHOT = """$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); $bmp.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.Dispose(); Write-Output "$($b.Width)x$($b.Height)" """
 
-_PS_CLICK = r"""
-$W::SetCursorPos({x}, {y}); Start-Sleep -Milliseconds 30
-$W::mouse_event({down},0,0,0,[IntPtr]::Zero); $W::mouse_event({up},0,0,0,[IntPtr]::Zero)
-"""
+_PS_CLICK = """$W::SetCursorPos({x}, {y}); Start-Sleep -Milliseconds 30; $W::mouse_event({down},0,0,0,[IntPtr]::Zero); $W::mouse_event({up},0,0,0,[IntPtr]::Zero)"""
 
-_PS_DOUBLE_CLICK = r"""
-$W::SetCursorPos({x}, {y}); Start-Sleep -Milliseconds 30
-$W::mouse_event(0x0002,0,0,0,[IntPtr]::Zero); $W::mouse_event(0x0004,0,0,0,[IntPtr]::Zero)
-Start-Sleep -Milliseconds 60
-$W::mouse_event(0x0002,0,0,0,[IntPtr]::Zero); $W::mouse_event(0x0004,0,0,0,[IntPtr]::Zero)
-"""
+_PS_DOUBLE_CLICK = """$W::SetCursorPos({x}, {y}); Start-Sleep -Milliseconds 30; $W::mouse_event(0x0002,0,0,0,[IntPtr]::Zero); $W::mouse_event(0x0004,0,0,0,[IntPtr]::Zero); Start-Sleep -Milliseconds 60; $W::mouse_event(0x0002,0,0,0,[IntPtr]::Zero); $W::mouse_event(0x0004,0,0,0,[IntPtr]::Zero)"""
 
 _PS_TYPE = """'{text}'.ToCharArray() | ForEach-Object {{ $vks=$W::VkKeyScan($_); $vk=$vks -band 0xFF; $sh=($vks -shr 8) -band 1; if($sh){{$W::keybd_event(0x10,0,0,[IntPtr]::Zero)}}; $W::keybd_event([byte]$vk,0,0,[IntPtr]::Zero); Start-Sleep -Milliseconds 20; $W::keybd_event([byte]$vk,0,$KU,[IntPtr]::Zero); if($sh){{$W::keybd_event(0x10,0,$KU,[IntPtr]::Zero)}}; Start-Sleep -Milliseconds 20 }}"""
 
@@ -153,6 +137,7 @@ class DesktopController:
         self._screen_height: int = 0
         self._wsl: bool = _is_wsl2()
         self._ps_proc: asyncio.subprocess.Process | None = None
+        self._last_click: tuple[int, int] | None = None
 
         if self._wsl:
             self._screenshot_path_win = r"C:\Users\Public\viewport_screenshot.png"
@@ -323,6 +308,8 @@ class DesktopController:
         else:
             await self._run("xdotool", "mousemove", "--sync", str(x), str(y))
             await self._run("xdotool", "click", str(button))
+        if button == 1:
+            self._last_click = (x, y)
 
     async def double_click(self, x: int, y: int):
         if self._wsl:
@@ -340,8 +327,23 @@ class DesktopController:
         if self._wsl:
             # Escape single quotes for PowerShell string
             escaped = text.replace("'", "''")
-            await self._ps_exec(_PS_TYPE.format(text=escaped))
+            if self._last_click:
+                # Re-click last position to restore focus (may have been lost
+                # by the screenshot that followed the original click)
+                lx, ly = self._last_click
+                refocus = _PS_CLICK.format(
+                    x=lx, y=ly, down=0x0002, up=0x0004
+                ) + "; Start-Sleep -Milliseconds 50; "
+                await self._ps_exec(
+                    refocus + _PS_TYPE.format(text=escaped)
+                )
+            else:
+                await self._ps_exec(_PS_TYPE.format(text=escaped))
         else:
+            if self._last_click:
+                lx, ly = self._last_click
+                await self._run("xdotool", "mousemove", "--sync", str(lx), str(ly))
+                await self._run("xdotool", "click", "1")
             await self._run("xdotool", "type", "--delay", "30", "--", text)
 
     async def key(self, combo: str):
