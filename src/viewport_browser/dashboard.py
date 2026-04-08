@@ -67,7 +67,7 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 </style>
 </head>
 <body>
-<div class="hdr"><h1>ViewPort</h1><div class="st" id="st"><span class="dot off"></span>Connecting...</div></div>
+<div class="hdr"><h1>ViewPort</h1><div style="display:flex;align-items:center;gap:12px"><select id="modelSel" onchange="setActiveModel(this.value)" style="background:#22252f;color:#e0e0e0;border:1px solid #333;padding:4px 8px;border-radius:4px;font-size:12px"></select><div class="st" id="st"><span class="dot off"></span>Connecting...</div></div></div>
 <div class="grid" id="grid"></div>
 <div class="mt" id="mt"><h2>No active browser sessions</h2><p>Sessions appear when an agent starts browsing.</p></div>
 <div class="tmod" id="tmod" onclick="if(event.target===this)closeTmod()">
@@ -83,6 +83,20 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 <script>
 const WS_PORT = __WS_PORT__;
 const S={};let fid=null;
+const DEFAULT_MODELS=[
+  {name:'Haiku 4.5',rate:0.8},{name:'Sonnet 4.5',rate:3},{name:'Opus 4',rate:15},
+  {name:'GPT-4o',rate:2.5},{name:'GPT-4o mini',rate:0.15},{name:'Gemini 2.5 Pro',rate:1.25}
+];
+let MODELS=DEFAULT_MODELS.map(m=>({...m}));
+let activeModel=0;
+try{const s=localStorage.getItem('vp-models');if(s)MODELS=JSON.parse(s);}catch(e){}
+try{const a=localStorage.getItem('vp-active-model');if(a!==null)activeModel=parseInt(a);}catch(e){}
+function setActiveModel(i){activeModel=parseInt(i);localStorage.setItem('vp-active-model',activeModel);}
+function initModelSel(){
+  const sel=document.getElementById('modelSel');
+  sel.innerHTML=MODELS.map((m,i)=>'<option value="'+i+'"'+(i===activeModel?' selected':'')+'>'+m.name+' ($'+m.rate+'/M)</option>').join('');
+}
+initModelSel();
 
 async function gt(){
   try{
@@ -184,8 +198,6 @@ function ctab(id){
 }
 function ue(){document.getElementById('mt').style.display=document.getElementById('grid').children.length?'none':'block';}
 
-let MODELS=[{name:'Haiku',rate:0.8},{name:'Sonnet',rate:3},{name:'Opus',rate:15}];
-try{const s=localStorage.getItem('vp-models');if(s)MODELS=JSON.parse(s);}catch(e){}
 
 function closeTmod(){document.getElementById('tmod').classList.remove('on');}
 function saveModels(){
@@ -197,6 +209,7 @@ function saveModels(){
     if(n&&v>0)MODELS.push({name:n,rate:v});
   });
   localStorage.setItem('vp-models',JSON.stringify(MODELS));
+  initModelSel();
   openTmod();
 }
 function renderModelConfig(){
@@ -252,18 +265,19 @@ async function openTmod(){
       h+='</tr>';
     }
     h+='</table>';
-    h+='<div class="section">By site (this month)</div><table>';
-    h+='<tr><th>Site</th><th class="num">Tokens</th><th class="num">Cost ('+MODELS[0]?.name+')</th></tr>';
+    const am=MODELS[activeModel]||MODELS[0]||{name:'?',rate:3};
+    h+='<div class="section">By site (this month) — '+am.name+'</div><table>';
+    h+='<tr><th>Site</th><th class="num">Tokens</th><th class="num">Cost</th></tr>';
     const sorted=Object.entries(byUrl).sort((a,b)=>b[1]-a[1]);
     for(const[site,tok]of sorted.slice(0,15)){
-      h+='<tr><td>'+site+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,MODELS[0]?.rate||3)+'</td></tr>';
+      h+='<tr><td>'+site+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,am.rate)+'</td></tr>';
     }
     h+='</table>';
-    h+='<div class="section">Daily (last 14 days)</div><table>';
-    h+='<tr><th>Date</th><th class="num">Tokens</th><th class="num">Cost ('+MODELS[0]?.name+')</th></tr>';
+    h+='<div class="section">Daily (last 14 days) — '+am.name+'</div><table>';
+    h+='<tr><th>Date</th><th class="num">Tokens</th><th class="num">Cost</th></tr>';
     const days=Object.entries(byDay).sort((a,b)=>b[0].localeCompare(a[0]));
     for(const[day,tok]of days.slice(0,14)){
-      h+='<tr><td>'+day+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,MODELS[0]?.rate||3)+'</td></tr>';
+      h+='<tr><td>'+day+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,am.rate)+'</td></tr>';
     }
     h+='</table>';
     h+=renderModelConfig();
@@ -285,7 +299,11 @@ async function poll(){
     for(const s of stats)byUrl[s.url]=s.tokens;
     for(const t of tabs){
       const el=document.getElementById('tk-'+t.id);
-      if(el){const tk=byUrl[t.url];el.textContent=tk?fmt(tk)+' tok':'';}
+      if(el){
+        const tk=byUrl[t.url];
+        if(tk){const am=MODELS[activeModel]||MODELS[0];const c=(tk*am.rate/1e6).toFixed(3);el.textContent=fmt(tk)+' · $'+c;}
+        else el.textContent='';
+      }
     }
   }catch(e){}
 }
