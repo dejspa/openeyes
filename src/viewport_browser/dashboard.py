@@ -434,7 +434,6 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == '/api/token-history':
-            import os
             log_path = os.path.expanduser("~/.viewport/token-log.jsonl")
             entries = []
             try:
@@ -452,21 +451,28 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == '/api/screenshot-history':
-            import glob as g
-            entries = []
-            for hist_dir in sorted(g.glob("/tmp/viewport-history-*")):
-                idx = os.path.join(hist_dir, "index.jsonl")
-                try:
-                    with open(idx) as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                e = json.loads(line)
-                                e["_dir"] = os.path.basename(hist_dir)
-                                entries.append(e)
-                except Exception:
-                    pass
-            data = json.dumps(entries).encode()
+            try:
+                entries = []
+                for name in sorted(os.listdir("/tmp")):
+                    if not name.startswith("viewport-history-"):
+                        continue
+                    hist_dir = os.path.join("/tmp", name)
+                    idx = os.path.join(hist_dir, "index.jsonl")
+                    try:
+                        with open(idx) as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    e = json.loads(line)
+                                    e["_dir"] = os.path.basename(hist_dir)
+                                    entries.append(e)
+                    except Exception:
+                        pass
+                data = json.dumps(entries).encode()
+            except Exception:
+                import traceback
+                print(traceback.format_exc(), file=sys.stderr)
+                data = b'[]'
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
