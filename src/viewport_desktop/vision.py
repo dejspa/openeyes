@@ -157,6 +157,37 @@ class VisionPipeline:
         img = overlay_coordinate_reference(img)
         return image_to_bytes(img)
 
+    def cursor_crop(self, png_bytes: bytes, cx: int, cy: int, size: int = 400) -> bytes:
+        """Crop a region around (cx, cy) at native resolution with a red crosshair.
+
+        Returns JPEG bytes of the cropped region.
+        """
+        img = Image.open(io.BytesIO(png_bytes))
+        w, h = img.size
+
+        # Clamp crop box to image bounds
+        left = max(cx - size // 2, 0)
+        top = max(cy - size // 2, 0)
+        right = min(left + size, w)
+        bottom = min(top + size, h)
+        # Adjust if we hit the right/bottom edge
+        if right - left < size:
+            left = max(right - size, 0)
+        if bottom - top < size:
+            top = max(bottom - size, 0)
+
+        crop = img.crop((left, top, right, bottom))
+
+        # Draw red crosshair at the center of the crop
+        draw = ImageDraw.Draw(crop)
+        ccx = cx - left
+        ccy = cy - top
+        arm = 10
+        draw.line([(ccx - arm, ccy), (ccx + arm, ccy)], fill=(255, 0, 0), width=2)
+        draw.line([(ccx, ccy - arm), (ccx, ccy + arm)], fill=(255, 0, 0), width=2)
+
+        return image_to_bytes(crop, fmt="JPEG", quality=85)
+
     def get_change_info(self, png_bytes: bytes) -> tuple[float, bytes | None]:
         """Compare new screenshot against previous one.
 

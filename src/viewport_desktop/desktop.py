@@ -122,6 +122,10 @@ _PS_KEY = """Do-Key '{combo}'"""
 
 _PS_SCROLL = """if ({x} -gt 0 -or {y} -gt 0) {{ $W::SetCursorPos({x}, {y}); Start-Sleep -Milliseconds 30 }}; $delta = if ('{direction}' -eq 'up') {{ 120 }} else {{ -120 }}; 1..{clicks} | ForEach-Object {{ $W::mouse_event(0x0800,0,0,$delta,[IntPtr]::Zero); Start-Sleep -Milliseconds 30 }}"""
 
+_PS_MOVE = """$W::SetCursorPos({x}, {y})"""
+
+_PS_CLICK_HERE = """$W::mouse_event({down},0,0,0,[IntPtr]::Zero); $W::mouse_event({up},0,0,0,[IntPtr]::Zero)"""
+
 _PS_DRAG = """$W::SetCursorPos({x1},{y1}); Start-Sleep -Milliseconds 50; $W::mouse_event(0x0002,0,0,0,[IntPtr]::Zero); 1..10 | ForEach-Object {{ $W::SetCursorPos([int]({x1}+({x2}-{x1})*$_/10),[int]({y1}+({y2}-{y1})*$_/10)); Start-Sleep -Milliseconds 10 }}; $W::mouse_event(0x0004,0,0,0,[IntPtr]::Zero)"""
 
 
@@ -138,6 +142,7 @@ class DesktopController:
         self._wsl: bool = _is_wsl2()
         self._ps_proc: asyncio.subprocess.Process | None = None
         self._last_click: tuple[int, int] | None = None
+        self._last_move: tuple[int, int] | None = None
 
         if self._wsl:
             self._screenshot_path_win = r"C:\Users\Public\viewport_screenshot.png"
@@ -320,6 +325,24 @@ class DesktopController:
 
     async def right_click(self, x: int, y: int):
         await self.click(x, y, button=3)
+
+    async def move_mouse(self, x: int, y: int):
+        """Move cursor to (x, y) without clicking."""
+        if self._wsl:
+            await self._ps_exec(_PS_MOVE.format(x=x, y=y))
+        else:
+            await self._run("xdotool", "mousemove", "--sync", str(x), str(y))
+        self._last_move = (x, y)
+
+    async def click_here(self, button: int = 1):
+        """Click at the current mouse position (no move)."""
+        down, up = self._BUTTON_FLAGS.get(button, (0x0002, 0x0004))
+        if self._wsl:
+            await self._ps_exec(_PS_CLICK_HERE.format(down=down, up=up))
+        else:
+            await self._run("xdotool", "click", str(button))
+        if button == 1 and self._last_move:
+            self._last_click = self._last_move
 
     # --- Keyboard ---
 

@@ -22,10 +22,11 @@ Vision-first desktop controller. Full computer control through screenshots and i
 No OS APIs — pure vision, just like a human.
 
 TOOLS:
-- screenshot() — see the current state of the desktop
-- click(x, y) — left-click at coordinates
-- double_click(x, y) — double-click at coordinates
-- right_click(x, y) — right-click for context menu
+- screenshot() — see the full desktop
+- move(x, y) — move mouse and see zoomed view around cursor (for precise targeting)
+- click(x, y) — quick click at coordinates (or omit x,y to click at current position after move)
+- double_click(x, y) — double-click (or omit x,y for current position)
+- right_click(x, y) — right-click (or omit x,y for current position)
 - type_text(text, press_enter) — type text on the keyboard
 - key(combo) — press keys: "Return", "ctrl+c", "alt+Tab", "super", "ctrl+shift+t"
 - scroll(direction, x, y) — scroll up/down at position
@@ -34,28 +35,31 @@ TOOLS:
 HOW IT WORKS:
 - You see a screenshot of the desktop (~896px wide).
 - Tick marks along the top and left edges at 200px intervals help you estimate coordinates.
-- Action tools (click, type, key, scroll, drag) are FAST — they return text-only feedback.
-- Only screenshot() returns an image. Call it when you need to see the screen.
-- There is NO snap-to-element. Your coordinates must be accurate.
-- There is NO get_text. Read text from the screenshot.
+- move() shows a ~400px zoomed crop around the cursor at native resolution — use it for precise clicks.
+- Action tools (click, type, key, scroll, drag) return text-only feedback (fast).
+- Only screenshot() and move() return images.
 
-SPEED — BE FAST:
-- Batch multiple actions before taking a screenshot. Don't screenshot after every action.
-- Example: click(x, y) → type_text("hello") → key("Return") → screenshot()
-  That's 3 fast actions + 1 screenshot, instead of 3 slow screenshot round-trips.
-- Only screenshot when you need to SEE something (verify result, find coordinates, read text).
+PRECISE CLICKING — use move() to aim:
+- move(x, y) → see zoomed view with crosshair → adjust if needed → click() to confirm
+- This is like a human: move cursor, look, adjust, click.
+- A red crosshair in the zoom shows exactly where the cursor is.
+
+FAST MODE — skip move() when precision isn't needed:
+- click(x, y) → type_text("hello") → key("Return") → screenshot()
+- Use this for large buttons, text fields, or known positions.
 
 STRATEGY GUIDE:
 1. OPEN AN APP: key("super") → type_text("firefox", press_enter=true) → screenshot()
-2. CLICK A BUTTON: click(x, y) → screenshot() to verify
-3. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot() to verify
-4. NAVIGATE MENUS: click menu → screenshot → click menu item → screenshot
-5. SWITCH WINDOWS: key("alt+Tab") → screenshot()
+2. PRECISE CLICK: move(x, y) → verify target in zoom → click() → screenshot()
+3. QUICK CLICK: click(x, y) → screenshot()
+4. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot()
+5. NAVIGATE MENUS: click menu → screenshot → move to item → click() → screenshot
 6. MULTI-STEP: click → type → key("Tab") → type → key("Return") → screenshot()
 
 RULES:
 - Always start with screenshot() to see the current desktop state.
-- Be precise with coordinates — there is no auto-snap.
+- Use move() for small targets (close buttons, icons, menu items).
+- Use click(x,y) for large targets (text areas, big buttons).
 - Use key("super") to open the app launcher/start menu.
 - Use key("alt+F4") to close windows.
 - Use key("ctrl+c")/key("ctrl+v") for copy/paste.
@@ -104,41 +108,73 @@ def _scale_coords(x: int, y: int) -> tuple[int, int]:
 async def screenshot() -> list:
     """Take a screenshot of the entire desktop. Always call this first to see what's on screen."""
     desktop = _get_desktop()
+    vision = _get_vision()
     err = desktop.check_tools()
     if err:
         return [f"ERROR: {err}\n\nInstall with: sudo apt install scrot xdotool"]
 
-    img, _, _ = await _capture()
+    png = await desktop.screenshot()
+    img = vision.process(png)
     return [MCPImage(data=img, format="jpeg")]
 
 
 @mcp.tool()
-async def click(x: int, y: int) -> list:
-    """Left-click at (x, y) on the screenshot. Returns text-only feedback (fast).
+async def move(x: int, y: int) -> list:
+    """Move the mouse to (x, y) and see a zoomed view around the cursor.
+    Use this to verify position before clicking. Returns a ~400x400 crop at native resolution.
+    After verifying, call click() to click at the current position."""
+    desktop = _get_desktop()
+    vision = _get_vision()
+    sx, sy = _scale_coords(x, y)
+    await desktop.move_mouse(sx, sy)
+    png = await desktop.screenshot()
+    full_img = vision.process(png)
+    crop_img = vision.cursor_crop(png, sx, sy)
+    return [
+        MCPImage(data=full_img, format="jpeg"),
+        MCPImage(data=crop_img, format="jpeg"),
+        f"Moved to ({x}, {y}) — zoomed crop shows cursor area. Call click() to click here.",
+    ]
+
+
+@mcp.tool()
+async def click(x: int = -1, y: int = -1) -> list:
+    """Left-click at (x, y) on the screenshot, or omit coordinates to click at current position.
     The screenshot is ~896px wide. Tick marks at 200px intervals help you estimate position.
-    There is no auto-snap — aim for the center of what you want to click.
     Use screenshot() after if you need to see the result."""
     desktop = _get_desktop()
+    if x == -1 and y == -1:
+        await desktop.click_here()
+        return ["Clicked at current position"]
     sx, sy = _scale_coords(x, y)
     await desktop.click(sx, sy)
     return [f"Clicked ({x}, {y})"]
 
 
 @mcp.tool()
-async def double_click(x: int, y: int) -> list:
-    """Double-click at (x, y). Use for opening files, selecting words, etc.
+async def double_click(x: int = -1, y: int = -1) -> list:
+    """Double-click at (x, y), or omit coordinates for current position.
+    Use for opening files, selecting words, etc.
     Use screenshot() after if you need to see the result."""
     desktop = _get_desktop()
+    if x == -1 and y == -1:
+        await desktop.click_here()
+        await asyncio.sleep(0.06)
+        await desktop.click_here()
+        return ["Double-clicked at current position"]
     sx, sy = _scale_coords(x, y)
     await desktop.double_click(sx, sy)
     return [f"Double-clicked ({x}, {y})"]
 
 
 @mcp.tool()
-async def right_click(x: int, y: int) -> list:
-    """Right-click at (x, y). Opens context menus.
+async def right_click(x: int = -1, y: int = -1) -> list:
+    """Right-click at (x, y), or omit coordinates for current position. Opens context menus.
     Use screenshot() after to see the menu."""
     desktop = _get_desktop()
+    if x == -1 and y == -1:
+        await desktop.click_here(button=3)
+        return ["Right-clicked at current position"]
     sx, sy = _scale_coords(x, y)
     await desktop.right_click(sx, sy)
     return [f"Right-clicked ({x}, {y})"]
