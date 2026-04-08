@@ -201,6 +201,7 @@ class BrowserManager:
                          f"{self._vw}x{self._vh}x24", "-nolisten", "tcp"],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        start_new_session=True,
                     )
                     time.sleep(0.5)
                     env["DISPLAY"] = self._xvfb_display
@@ -214,6 +215,7 @@ class BrowserManager:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     env=env,
+                    start_new_session=True,  # survive agent/MCP shutdown
                 )
                 for _ in range(30):
                     try:
