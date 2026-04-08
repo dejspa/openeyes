@@ -323,7 +323,8 @@ async function poll(){
           for(const[k,v]of Object.entries(RATES)){if(rateKey.includes(k)||k.includes(rateKey)){rate=v;break;}}
           if(!rate){const am=MODELS[activeModel]||MODELS[0];rate=am?.rate||3;}
           const c=(st.tokens*rate/1e6).toFixed(3);
-          el.textContent=model+' · '+fmt(st.tokens)+' · $'+c;
+          const sess=st.session&&st.session!=='default'?st.session+' · ':'';
+          el.textContent=sess+model+' · '+fmt(st.tokens)+' · $'+c;
         } else el.textContent='';
       }
     }

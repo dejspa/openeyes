@@ -108,7 +108,7 @@ def _write_token_stats():
     """Write token stats to shared file for dashboard to read."""
     import json
     stats = [
-        {"url": page.url, "tokens": _page_tokens.get(id(page), 0), "model": _current_model}
+        {"url": page.url, "tokens": _page_tokens.get(id(page), 0), "model": _current_model, "session": _session}
         for page in _browser._pages
     ]
     try:
@@ -137,13 +137,17 @@ def _append_token_log(url: str, tokens: int):
 
 
 def get_token_stats() -> list[dict]:
-    """Returns [{url, tokens}, ...] for each tab. Reads from shared file."""
+    """Returns [{url, tokens, session}, ...] for all sessions. Reads all token files."""
+    import glob
     import json
-    try:
-        with open(_TOKEN_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return []
+    result = []
+    for path in glob.glob("/tmp/viewport-tokens-*.json"):
+        try:
+            with open(path) as f:
+                result.extend(json.load(f))
+        except Exception:
+            pass
+    return result
 
 
 async def _get_browser() -> BrowserManager:
