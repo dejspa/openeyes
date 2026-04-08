@@ -81,6 +81,8 @@ _browser: BrowserManager | None = None
 _vision: VisionPipeline | None = None
 _memory: PageMemory | None = None
 _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
+_TOKEN_FILE = "/tmp/viewport-tokens.json"
+_TOKEN_LOG = os.path.expanduser("~/.viewport/token-log.jsonl")
 
 
 def _track(response: list) -> list:
@@ -94,17 +96,49 @@ def _track(response: list) -> list:
     if _browser and _browser._pages:
         pid = id(_browser._pages[_browser._active])
         _page_tokens[pid] = _page_tokens.get(pid, 0) + tokens
+        _write_token_stats()
+        _append_token_log(_browser._pages[_browser._active].url, tokens)
     return response
 
 
-def get_token_stats() -> list[dict]:
-    """Returns [{url, tokens}, ...] for each tab. Used by dashboard."""
-    if not _browser or not _browser._pages:
-        return []
-    return [
+def _write_token_stats():
+    """Write token stats to shared file for dashboard to read."""
+    import json
+    stats = [
         {"url": page.url, "tokens": _page_tokens.get(id(page), 0)}
         for page in _browser._pages
     ]
+    try:
+        with open(_TOKEN_FILE, "w") as f:
+            json.dump(stats, f)
+    except Exception:
+        pass
+
+
+def _append_token_log(url: str, tokens: int):
+    """Append token usage to persistent log for historical tracking."""
+    import json
+    from datetime import datetime, timezone
+    try:
+        os.makedirs(os.path.dirname(_TOKEN_LOG), exist_ok=True)
+        with open(_TOKEN_LOG, "a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "url": url,
+                "tokens": tokens,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def get_token_stats() -> list[dict]:
+    """Returns [{url, tokens}, ...] for each tab. Reads from shared file."""
+    import json
+    try:
+        with open(_TOKEN_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
 async def _get_browser() -> BrowserManager:

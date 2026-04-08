@@ -33,7 +33,21 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 .tile:hover{border-color:#4a9eff}
 .th{padding:8px 12px;background:#22252f;font-size:13px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;display:flex;align-items:center;justify-content:space-between}
 .th .title{overflow:hidden;text-overflow:ellipsis;flex:1}
-.th .tkn{color:#888;font-size:11px;margin-left:8px;white-space:nowrap}
+.th .tkn{color:#4ade80;font-size:11px;margin-left:8px;white-space:nowrap;cursor:pointer}
+.th .tkn:hover{color:#fff}
+.tmod{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center}
+.tmod.on{display:flex}
+.tmod .tbox{background:#1a1d27;border-radius:12px;padding:24px;width:520px;max-height:80vh;overflow-y:auto;border:1px solid #2a2d37}
+.tmod h2{font-size:18px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
+.tmod .xbtn{background:none;border:none;color:#888;font-size:20px;cursor:pointer}
+.tmod .xbtn:hover{color:#fff}
+.tmod table{width:100%;border-collapse:collapse;margin-bottom:16px}
+.tmod th{text-align:left;color:#888;font-size:11px;text-transform:uppercase;padding:6px 8px;border-bottom:1px solid #2a2d37}
+.tmod td{padding:6px 8px;font-size:13px;border-bottom:1px solid #1f222c}
+.tmod .num{text-align:right;font-variant-numeric:tabular-nums}
+.tmod .section{color:#888;font-size:12px;margin:16px 0 8px;text-transform:uppercase;letter-spacing:1px}
+.tmod .total{font-weight:600;color:#4ade80}
+.tmod .cost{color:#f0c040}
 .th .close{background:#ef4444;color:#fff;border:none;border-radius:3px;padding:2px 8px;cursor:pointer;font-size:11px;margin-left:8px;opacity:.7}
 .th .close:hover{opacity:1}
 .tb{position:relative;cursor:pointer;background:#000}
@@ -56,6 +70,12 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 <div class="hdr"><h1>ViewPort</h1><div class="st" id="st"><span class="dot off"></span>Connecting...</div></div>
 <div class="grid" id="grid"></div>
 <div class="mt" id="mt"><h2>No active browser sessions</h2><p>Sessions appear when an agent starts browsing.</p></div>
+<div class="tmod" id="tmod" onclick="if(event.target===this)closeTmod()">
+  <div class="tbox">
+    <h2>Token Usage <button class="xbtn" onclick="closeTmod()">&times;</button></h2>
+    <div id="tmod-content"></div>
+  </div>
+</div>
 <div class="fs" id="fs">
   <div class="bar"><div><span id="fst"></span><span class="badge">LIVE</span></div><button onclick="xfs()">Close (Esc)</button></div>
   <div class="vp"><img id="fsi"/></div>
@@ -107,6 +127,7 @@ function mt(t){
   const hdr=document.createElement('div');hdr.className='th';
   const title=document.createElement('span');title.className='title';title.textContent=t.title||t.url;
   const tkn=document.createElement('span');tkn.className='tkn';tkn.id='tk-'+t.id;
+  tkn.onclick=function(e){e.stopPropagation();openTmod();};
   const cbtn=document.createElement('button');cbtn.className='close';cbtn.textContent='Close';
   cbtn.onclick=function(e){e.stopPropagation();ctab(t.id);};
   hdr.appendChild(title);hdr.appendChild(tkn);hdr.appendChild(cbtn);
@@ -162,6 +183,55 @@ function ctab(id){
   });
 }
 function ue(){document.getElementById('mt').style.display=document.getElementById('grid').children.length?'none':'block';}
+
+function closeTmod(){document.getElementById('tmod').classList.remove('on');}
+async function openTmod(){
+  document.getElementById('tmod').classList.add('on');
+  const el=document.getElementById('tmod-content');
+  el.innerHTML='Loading...';
+  try{
+    const r=await fetch('/api/token-history');
+    const entries=await r.json();
+    const now=new Date();
+    const todayStr=now.toISOString().slice(0,10);
+    const monthStr=now.toISOString().slice(0,7);
+    let todayTok=0,monthTok=0,allTok=0;
+    const byDay={},byUrl={};
+    for(const e of entries){
+      const day=e.ts.slice(0,10);
+      const mo=e.ts.slice(0,7);
+      allTok+=e.tokens;
+      if(day===todayStr)todayTok+=e.tokens;
+      if(mo===monthStr)monthTok+=e.tokens;
+      byDay[day]=(byDay[day]||0)+e.tokens;
+      const host=e.url.replace(/https?:\\/\\//,'').split('/')[0];
+      byUrl[host]=(byUrl[host]||0)+e.tokens;
+    }
+    const cost=(tok,rate)=>'$'+(tok*rate/1e6).toFixed(4);
+    let h='<div class="section">Summary</div><table>';
+    h+='<tr><th>Period</th><th class="num">Tokens</th><th class="num">Haiku</th><th class="num">Sonnet</th><th class="num">Opus</th></tr>';
+    h+='<tr><td>Today</td><td class="num total">'+fmt(todayTok)+'</td><td class="num cost">'+cost(todayTok,0.8)+'</td><td class="num cost">'+cost(todayTok,3)+'</td><td class="num cost">'+cost(todayTok,15)+'</td></tr>';
+    h+='<tr><td>This month</td><td class="num total">'+fmt(monthTok)+'</td><td class="num cost">'+cost(monthTok,0.8)+'</td><td class="num cost">'+cost(monthTok,3)+'</td><td class="num cost">'+cost(monthTok,15)+'</td></tr>';
+    h+='<tr><td>All time</td><td class="num total">'+fmt(allTok)+'</td><td class="num cost">'+cost(allTok,0.8)+'</td><td class="num cost">'+cost(allTok,3)+'</td><td class="num cost">'+cost(allTok,15)+'</td></tr>';
+    h+='</table>';
+    h+='<div class="section">By site (this month)</div><table>';
+    h+='<tr><th>Site</th><th class="num">Tokens</th><th class="num">Sonnet cost</th></tr>';
+    const sorted=Object.entries(byUrl).sort((a,b)=>b[1]-a[1]);
+    for(const[site,tok]of sorted.slice(0,15)){
+      h+='<tr><td>'+site+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,3)+'</td></tr>';
+    }
+    h+='</table>';
+    h+='<div class="section">Daily (last 14 days)</div><table>';
+    h+='<tr><th>Date</th><th class="num">Tokens</th><th class="num">Sonnet cost</th></tr>';
+    const days=Object.entries(byDay).sort((a,b)=>b[0].localeCompare(a[0]));
+    for(const[day,tok]of days.slice(0,14)){
+      h+='<tr><td>'+day+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,3)+'</td></tr>';
+    }
+    h+='</table>';
+    h+='<div style="color:#555;font-size:11px;margin-top:12px">Cost = estimated vision input tokens × model rate. Haiku $0.80/M · Sonnet $3/M · Opus $15/M</div>';
+    el.innerHTML=h;
+  }catch(e){el.innerHTML='Failed to load token history.';}
+}
 
 async function poll(){
   const tabs=await gt();
@@ -227,6 +297,24 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
                 data = json.dumps(get_token_stats()).encode()
             except Exception:
                 data = b'[]'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == '/api/token-history':
+            import os
+            log_path = os.path.expanduser("~/.viewport/token-log.jsonl")
+            entries = []
+            try:
+                with open(log_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            entries.append(json.loads(line))
+            except Exception:
+                pass
+            data = json.dumps(entries).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
