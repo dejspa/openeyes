@@ -213,8 +213,7 @@ function saveModels(){
   openTmod();
 }
 function renderModelConfig(){
-  let h='<div class="section">Model Pricing ($/M input tokens)</div>';
-  h+='<table>';
+  let h='<table>';
   for(const m of MODELS){
     h+='<tr class="mrow"><td><input class="mname" value="'+m.name+'" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:100px"></td>';
     h+='<td class="num"><input class="mrate" type="number" step="0.1" value="'+m.rate+'" style="background:#22252f;border:1px solid #333;color:#e0e0e0;padding:3px 6px;border-radius:3px;width:70px;text-align:right"></td>';
@@ -242,45 +241,60 @@ async function openTmod(){
     const now=new Date();
     const todayStr=now.toISOString().slice(0,10);
     const monthStr=now.toISOString().slice(0,7);
-    let todayTok=0,monthTok=0,allTok=0;
-    const byDay={},byUrl={};
+    let todayTok=0,monthTok=0,allTok=0,todayCost=0,monthCost=0,allCost=0;
+    const byDay={},byUrl={},byModel={};
+    const modelRates=Object.fromEntries(MODELS.map(m=>[m.name.toLowerCase().replace(/[^a-z0-9.-]/g,''),m.rate]));
+    function findRate(m){
+      if(!m||m==='unknown')return 0;
+      const k=m.toLowerCase();
+      for(const[name,rate]of Object.entries(modelRates)){if(k.includes(name)||name.includes(k))return rate;}
+      return 0;
+    }
     for(const e of entries){
       const day=e.ts.slice(0,10);
       const mo=e.ts.slice(0,7);
-      allTok+=e.tokens;
-      if(day===todayStr)todayTok+=e.tokens;
-      if(mo===monthStr)monthTok+=e.tokens;
-      byDay[day]=(byDay[day]||0)+e.tokens;
+      const rate=findRate(e.model);
+      const c=e.tokens*rate/1e6;
+      allTok+=e.tokens;allCost+=c;
+      if(day===todayStr){todayTok+=e.tokens;todayCost+=c;}
+      if(mo===monthStr){monthTok+=e.tokens;monthCost+=c;}
+      byDay[day]=byDay[day]||{tokens:0,cost:0};byDay[day].tokens+=e.tokens;byDay[day].cost+=c;
       const host=e.url.replace(/https?:\\/\\//,'').split('/')[0];
-      byUrl[host]=(byUrl[host]||0)+e.tokens;
+      byUrl[host]=byUrl[host]||{tokens:0,cost:0};byUrl[host].tokens+=e.tokens;byUrl[host].cost+=c;
+      const mn=e.model||'unknown';
+      byModel[mn]=byModel[mn]||{tokens:0,cost:0};byModel[mn].tokens+=e.tokens;byModel[mn].cost+=c;
     }
-    const cost=(tok,rate)=>'$'+(tok*rate/1e6).toFixed(4);
+    const cost=(v)=>'$'+v.toFixed(4);
     let h='<div class="section">Summary</div><table>';
-    h+='<tr><th>Period</th><th class="num">Tokens</th>';
-    for(const m of MODELS)h+='<th class="num">'+m.name+'</th>';
-    h+='</tr>';
-    for(const[label,tok]of[['Today',todayTok],['This month',monthTok],['All time',allTok]]){
-      h+='<tr><td>'+label+'</td><td class="num total">'+fmt(tok)+'</td>';
-      for(const m of MODELS)h+='<td class="num cost">'+cost(tok,m.rate)+'</td>';
-      h+='</tr>';
+    h+='<tr><th>Period</th><th class="num">Tokens</th><th class="num">Actual Cost</th></tr>';
+    h+='<tr><td>Today</td><td class="num total">'+fmt(todayTok)+'</td><td class="num cost">'+cost(todayCost)+'</td></tr>';
+    h+='<tr><td>This month</td><td class="num total">'+fmt(monthTok)+'</td><td class="num cost">'+cost(monthCost)+'</td></tr>';
+    h+='<tr><td>All time</td><td class="num total">'+fmt(allTok)+'</td><td class="num cost">'+cost(allCost)+'</td></tr>';
+    h+='</table>';
+    h+='<div class="section">By model</div><table>';
+    h+='<tr><th>Model</th><th class="num">Tokens</th><th class="num">Rate</th><th class="num">Cost</th></tr>';
+    for(const[mn,d]of Object.entries(byModel).sort((a,b)=>b[1].tokens-a[1].tokens)){
+      const r=findRate(mn);
+      h+='<tr><td>'+mn+'</td><td class="num">'+fmt(d.tokens)+'</td><td class="num">$'+r+'/M</td><td class="num cost">'+cost(d.cost)+'</td></tr>';
     }
     h+='</table>';
-    const am=MODELS[activeModel]||MODELS[0]||{name:'?',rate:3};
-    h+='<div class="section">By site (this month) — '+am.name+'</div><table>';
+    h+='<div class="section">By site (this month)</div><table>';
     h+='<tr><th>Site</th><th class="num">Tokens</th><th class="num">Cost</th></tr>';
-    const sorted=Object.entries(byUrl).sort((a,b)=>b[1]-a[1]);
-    for(const[site,tok]of sorted.slice(0,15)){
-      h+='<tr><td>'+site+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,am.rate)+'</td></tr>';
+    const sorted=Object.entries(byUrl).sort((a,b)=>b[1].tokens-a[1].tokens);
+    for(const[site,d]of sorted.slice(0,15)){
+      h+='<tr><td>'+site+'</td><td class="num">'+fmt(d.tokens)+'</td><td class="num cost">'+cost(d.cost)+'</td></tr>';
     }
     h+='</table>';
-    h+='<div class="section">Daily (last 14 days) — '+am.name+'</div><table>';
+    h+='<div class="section">Daily (last 14 days)</div><table>';
     h+='<tr><th>Date</th><th class="num">Tokens</th><th class="num">Cost</th></tr>';
     const days=Object.entries(byDay).sort((a,b)=>b[0].localeCompare(a[0]));
-    for(const[day,tok]of days.slice(0,14)){
-      h+='<tr><td>'+day+'</td><td class="num">'+fmt(tok)+'</td><td class="num cost">'+cost(tok,am.rate)+'</td></tr>';
+    for(const[day,d]of days.slice(0,14)){
+      h+='<tr><td>'+day+'</td><td class="num">'+fmt(d.tokens)+'</td><td class="num cost">'+cost(d.cost)+'</td></tr>';
     }
     h+='</table>';
+    h+='<div class="section">Model Pricing (edit rates)</div>';
     h+=renderModelConfig();
+    h+='<div style="color:#555;font-size:11px;margin-top:12px">Cost based on actual model used per call (reported via set_model tool). Agents call set_model() once at session start.</div>';
     el.innerHTML=h;
   }catch(e){el.innerHTML='Failed to load token history.';}
 }
@@ -300,9 +314,17 @@ async function poll(){
     for(const t of tabs){
       const el=document.getElementById('tk-'+t.id);
       if(el){
-        const tk=byUrl[t.url];
-        if(tk){const am=MODELS[activeModel]||MODELS[0];const c=(tk*am.rate/1e6).toFixed(3);el.textContent=fmt(tk)+' · $'+c;}
-        else el.textContent='';
+        const st=stats.find(s=>s.url===t.url);
+        if(st&&st.tokens){
+          const model=st.model||'unknown';
+          const rateKey=model.toLowerCase();
+          const RATES=Object.fromEntries(MODELS.map(m=>[m.name.toLowerCase().replace(/[^a-z0-9.-]/g,''),m.rate]));
+          let rate=0;
+          for(const[k,v]of Object.entries(RATES)){if(rateKey.includes(k)||k.includes(rateKey)){rate=v;break;}}
+          if(!rate){const am=MODELS[activeModel]||MODELS[0];rate=am?.rate||3;}
+          const c=(st.tokens*rate/1e6).toFixed(3);
+          el.textContent=model+' · '+fmt(st.tokens)+' · $'+c;
+        } else el.textContent='';
       }
     }
   }catch(e){}

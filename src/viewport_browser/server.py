@@ -82,6 +82,7 @@ _browser: BrowserManager | None = None
 _vision: VisionPipeline | None = None
 _memory: PageMemory | None = None
 _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
+_current_model: str = os.environ.get("VIEWPORT_MODEL", "unknown")
 _TOKEN_FILE = "/tmp/viewport-tokens.json"
 _TOKEN_LOG = os.path.expanduser("~/.viewport/token-log.jsonl")
 
@@ -106,7 +107,7 @@ def _write_token_stats():
     """Write token stats to shared file for dashboard to read."""
     import json
     stats = [
-        {"url": page.url, "tokens": _page_tokens.get(id(page), 0)}
+        {"url": page.url, "tokens": _page_tokens.get(id(page), 0), "model": _current_model}
         for page in _browser._pages
     ]
     try:
@@ -127,6 +128,7 @@ def _append_token_log(url: str, tokens: int):
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "url": url,
                 "tokens": tokens,
+                "model": _current_model,
             }) + "\n")
     except Exception:
         pass
@@ -220,6 +222,28 @@ def _build_response(img: bytes, crop: bytes | None, context: str,
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+# Model pricing lookup for cost tracking
+_MODEL_RATES: dict[str, float] = {
+    "haiku": 0.8, "haiku-4.5": 0.8, "claude-haiku-4-5": 0.8,
+    "sonnet": 3, "sonnet-4.5": 3, "sonnet-4.6": 3, "claude-sonnet-4-5": 3, "claude-sonnet-4-6": 3,
+    "opus": 15, "opus-4": 15, "opus-4.6": 15, "claude-opus-4-6": 15,
+    "gpt-4o": 2.5, "gpt-4o-mini": 0.15, "gemini-2.5-pro": 1.25,
+}
+
+
+@mcp.tool()
+async def set_model(model: str) -> str:
+    """Tell viewport which AI model is using it, for accurate cost tracking.
+    Call this once at the start of your session.
+    Examples: set_model("sonnet-4.5"), set_model("haiku"), set_model("opus")"""
+    global _current_model
+    _current_model = model.lower().strip()
+    rate = _MODEL_RATES.get(_current_model, None)
+    if rate:
+        return f"Model set to '{_current_model}' (${rate}/M input tokens)"
+    return f"Model set to '{_current_model}' (unknown pricing — add rate via dashboard)"
+
 
 @mcp.tool()
 async def navigate(url: str) -> list:
