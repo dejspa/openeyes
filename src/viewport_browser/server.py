@@ -171,7 +171,7 @@ def _get_memory() -> PageMemory:
     return _memory
 
 
-_HISTORY_DIR = f"/tmp/viewport-history-{_session}"
+_HISTORY_DIR = os.path.expanduser(f"~/.viewport/history/{_session}")
 
 async def _capture() -> tuple[bytes, bytes | None, str, float]:
     """Take screenshot, process it.

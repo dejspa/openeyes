@@ -453,10 +453,9 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == '/api/screenshot-history':
             try:
                 entries = []
-                for name in sorted(os.listdir("/tmp")):
-                    if not name.startswith("viewport-history-"):
-                        continue
-                    hist_dir = os.path.join("/tmp", name)
+                hist_root = os.path.expanduser("~/.viewport/history")
+                for name in sorted(os.listdir(hist_root)) if os.path.isdir(hist_root) else []:
+                    hist_dir = os.path.join(hist_root, name)
                     idx = os.path.join(hist_dir, "index.jsonl")
                     try:
                         with open(idx) as f:
@@ -482,7 +481,7 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             # Serve screenshot files: /screenshots/{dir}/{filename}
             parts = self.path.split('/')
             if len(parts) >= 4:
-                filepath = os.path.join("/tmp", parts[2], parts[3])
+                filepath = os.path.join(os.path.expanduser("~/.viewport/history"), parts[2], parts[3])
                 try:
                     with open(filepath, "rb") as f:
                         data = f.read()
