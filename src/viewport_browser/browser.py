@@ -314,8 +314,29 @@ class BrowserManager:
 
     async def new_tab(self, url: str = "about:blank", pin: str = "") -> int:
         """Open a new tab. Optional pin name makes it findable by keyword
-        and protects it from close_tab. Returns the new tab's index."""
+        and protects it from close_tab. Returns the new tab's index.
+        If a tab with the same domain is already open, switches to it instead."""
         await self._ensure_browser()
+
+        # Reuse existing tab with same domain if possible
+        if url and url != "about:blank":
+            from urllib.parse import urlparse
+            try:
+                domain = urlparse(url if "://" in url else f"https://{url}").netloc.lower().replace("www.", "")
+            except Exception:
+                domain = ""
+            if domain:
+                for i, page in enumerate(self._pages):
+                    try:
+                        existing = urlparse(page.url).netloc.lower().replace("www.", "")
+                    except Exception:
+                        continue
+                    if existing == domain:
+                        self._active = i
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await _human_delay(300, 700)
+                        return self._active
+
         self._expect_new_page = True
         page = await self._context.new_page()
         self._expect_new_page = False
