@@ -34,22 +34,27 @@ TOOLS:
 HOW IT WORKS:
 - You see a screenshot of the desktop (~896px wide).
 - Tick marks along the top and left edges at 200px intervals help you estimate coordinates.
-- Click/type/key commands control the real mouse and keyboard.
-- After each action, you get a new screenshot showing the result.
+- Action tools (click, type, key, scroll, drag) are FAST — they return text-only feedback.
+- Only screenshot() returns an image. Call it when you need to see the screen.
 - There is NO snap-to-element. Your coordinates must be accurate.
 - There is NO get_text. Read text from the screenshot.
 
+SPEED — BE FAST:
+- Batch multiple actions before taking a screenshot. Don't screenshot after every action.
+- Example: click(x, y) → type_text("hello") → key("Return") → screenshot()
+  That's 3 fast actions + 1 screenshot, instead of 3 slow screenshot round-trips.
+- Only screenshot when you need to SEE something (verify result, find coordinates, read text).
+
 STRATEGY GUIDE:
-1. OPEN AN APP: key("super") → screenshot → type_text("firefox") → key("Return") → screenshot
-2. CLICK A BUTTON: Look at screenshot, estimate (x, y) of the button, click(x, y)
-3. TYPE IN A FIELD: click the field first to focus it, then type_text("hello")
-4. NAVIGATE MENUS: click menu → screenshot → click menu item
-5. SWITCH WINDOWS: key("alt+Tab") → screenshot
-6. FILE MANAGER: key("super") → type_text("files") → key("Return") → screenshot
+1. OPEN AN APP: key("super") → type_text("firefox", press_enter=true) → screenshot()
+2. CLICK A BUTTON: click(x, y) → screenshot() to verify
+3. TYPE IN A FIELD: click(x, y) → type_text("hello") → screenshot() to verify
+4. NAVIGATE MENUS: click menu → screenshot → click menu item → screenshot
+5. SWITCH WINDOWS: key("alt+Tab") → screenshot()
+6. MULTI-STEP: click → type → key("Tab") → type → key("Return") → screenshot()
 
 RULES:
 - Always start with screenshot() to see the current desktop state.
-- Take a screenshot after actions to confirm the result.
 - Be precise with coordinates — there is no auto-snap.
 - Use key("super") to open the app launcher/start menu.
 - Use key("alt+F4") to close windows.
@@ -75,21 +80,6 @@ def _get_vision() -> VisionPipeline:
     return _vision
 
 
-async def _capture() -> tuple[bytes, bytes | None, float]:
-    """Take screenshot, process it.
-
-    Returns (jpeg_bytes, crop_jpeg_or_none, diff_ratio).
-    """
-    desktop = _get_desktop()
-    vision = _get_vision()
-
-    png = await desktop.screenshot()
-    diff_ratio, crop_jpeg = vision.get_change_info(png)
-    jpeg_bytes = vision.process(png)
-
-    return jpeg_bytes, crop_jpeg, diff_ratio
-
-
 def _scale_coords(x: int, y: int) -> tuple[int, int]:
     """Scale from screenshot coordinates to actual screen coordinates."""
     desktop = _get_desktop()
@@ -103,27 +93,6 @@ def _scale_coords(x: int, y: int) -> tuple[int, int]:
     sx = sw / vision.actual_width
     sy = sh / vision.actual_height
     return int(x * sx), int(y * sy)
-
-
-def _build_response(
-    img: bytes, crop: bytes | None, diff_ratio: float, text: str = ""
-) -> list:
-    """Build response — smart about what images to include."""
-    if diff_ratio < 0.02:
-        return [text or "Screen unchanged"]
-
-    if crop and 0.05 < diff_ratio < 0.3:
-        result = [MCPImage(data=crop, format="jpeg")]
-        if text:
-            result.append(
-                text + "\n[Showing changed area. Use screenshot() for full screen.]"
-            )
-        return result
-
-    result = [MCPImage(data=img, format="jpeg")]
-    if text:
-        result.append(text)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -145,94 +114,87 @@ async def screenshot() -> list:
 
 @mcp.tool()
 async def click(x: int, y: int) -> list:
-    """Left-click at (x, y) on the screenshot.
+    """Left-click at (x, y) on the screenshot. Returns text-only feedback (fast).
     The screenshot is ~896px wide. Tick marks at 200px intervals help you estimate position.
-    There is no auto-snap — aim for the center of what you want to click."""
+    There is no auto-snap — aim for the center of what you want to click.
+    Use screenshot() after if you need to see the result."""
     desktop = _get_desktop()
     sx, sy = _scale_coords(x, y)
     await desktop.click(sx, sy)
-    await asyncio.sleep(0.3)
-    img, crop, diff = await _capture()
-    return _build_response(img, crop, diff, f"Clicked ({x}, {y})")
+    return [f"Clicked ({x}, {y})"]
 
 
 @mcp.tool()
 async def double_click(x: int, y: int) -> list:
-    """Double-click at (x, y). Use for opening files, selecting words, etc."""
+    """Double-click at (x, y). Use for opening files, selecting words, etc.
+    Use screenshot() after if you need to see the result."""
     desktop = _get_desktop()
     sx, sy = _scale_coords(x, y)
     await desktop.double_click(sx, sy)
-    await asyncio.sleep(0.3)
-    img, crop, diff = await _capture()
-    return _build_response(img, crop, diff, f"Double-clicked ({x}, {y})")
+    return [f"Double-clicked ({x}, {y})"]
 
 
 @mcp.tool()
 async def right_click(x: int, y: int) -> list:
-    """Right-click at (x, y). Opens context menus."""
+    """Right-click at (x, y). Opens context menus.
+    Use screenshot() after to see the menu."""
     desktop = _get_desktop()
     sx, sy = _scale_coords(x, y)
     await desktop.right_click(sx, sy)
-    await asyncio.sleep(0.3)
-    img, crop, diff = await _capture()
-    return _build_response(img, crop, diff, f"Right-clicked ({x}, {y})")
+    return [f"Right-clicked ({x}, {y})"]
 
 
 @mcp.tool()
 async def type_text(text: str, press_enter: bool = False) -> list:
     """Type text on the keyboard. Set press_enter=true to press Enter after typing.
-    Click a text field first to focus it before typing."""
+    Click a text field first to focus it before typing.
+    Returns text-only feedback (fast). Use screenshot() to verify."""
     desktop = _get_desktop()
     await desktop.type_text(text)
     if press_enter:
         await asyncio.sleep(0.05)
         await desktop.key("Return")
-        await asyncio.sleep(0.5)
-        img, crop, diff = await _capture()
-        return _build_response(img, crop, diff, f"Typed: '{text}' + Enter")
-    return [f"Typed: '{text}'"]
+    msg = f"Typed: '{text}'"
+    if press_enter:
+        msg += " + Enter"
+    return [msg]
 
 
 @mcp.tool()
 async def key(combo: str) -> list:
-    """Press a key or key combination.
+    """Press a key or key combination. Returns text-only feedback (fast).
     Examples: 'Return', 'Escape', 'Tab', 'BackSpace', 'Delete',
               'ctrl+c', 'ctrl+v', 'ctrl+z', 'alt+Tab', 'alt+F4',
-              'super' (opens app launcher), 'ctrl+shift+t', 'space'"""
+              'super' (opens app launcher), 'ctrl+shift+t', 'space'
+    Use screenshot() after if you need to see the result."""
     desktop = _get_desktop()
     await desktop.key(combo)
-    await asyncio.sleep(0.5)
-    img, crop, diff = await _capture()
-    return _build_response(img, crop, diff, f"Pressed: {combo}")
+    return [f"Pressed: {combo}"]
 
 
 @mcp.tool()
 async def scroll(direction: str = "down", x: int = 0, y: int = 0) -> list:
     """Scroll up or down. Optionally at a specific position (x, y).
-    If x and y are 0, scrolls at current mouse position."""
+    If x and y are 0, scrolls at current mouse position.
+    Use screenshot() after to see the result."""
     desktop = _get_desktop()
     if x > 0 or y > 0:
         sx, sy = _scale_coords(x, y)
     else:
         sx, sy = 0, 0
     await desktop.scroll(direction, sx, sy)
-    await asyncio.sleep(0.3)
-    img, crop, diff = await _capture()
-    if diff < 0.02:
-        return [f"Scrolled {direction} — no change visible"]
-    return _build_response(img, crop, diff, f"Scrolled {direction}")
+    return [f"Scrolled {direction}"]
 
 
 @mcp.tool()
 async def drag(x1: int, y1: int, x2: int, y2: int) -> list:
-    """Drag from (x1, y1) to (x2, y2). For moving windows, selecting text, resizing, etc."""
+    """Drag from (x1, y1) to (x2, y2). For moving windows, selecting text, resizing, etc.
+    Use screenshot() after to see the result."""
     desktop = _get_desktop()
     sx1, sy1 = _scale_coords(x1, y1)
     sx2, sy2 = _scale_coords(x2, y2)
     await desktop.drag(sx1, sy1, sx2, sy2)
-    await asyncio.sleep(0.3)
-    img, crop, diff = await _capture()
-    return _build_response(img, crop, diff, f"Dragged ({x1},{y1}) -> ({x2},{y2})")
+    return [f"Dragged ({x1},{y1}) -> ({x2},{y2})"]
 
 
 def main():
