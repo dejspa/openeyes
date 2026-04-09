@@ -218,25 +218,16 @@ class VisionPipeline:
 
     # --- OCR text finding ---
 
-    def find_text(self, png_bytes: bytes, query: str) -> list[dict]:
-        """Find all occurrences of *query* (case-insensitive substring) on screen.
-
-        Uses pytesseract OCR at native resolution.  Returns a list of match
-        dicts: ``[{"text": str, "cx": int, "cy": int, "x": int, "y": int,
-        "w": int, "h": int}]`` where cx/cy are center coordinates in native
-        screen pixels.
-        """
-        if not _HAS_TESSERACT:
-            print("[vision] pytesseract not installed — OCR disabled. "
-                  "Install with: pip install pytesseract", flush=True)
-            return []
+    def _ocr_lines(self, png_bytes: bytes) -> dict[tuple, list[dict]]:
+        """Run OCR and cache results. Returns lines grouped by (block, par, line)."""
+        # Cache key: id of the bytes object
+        cache_key = id(png_bytes)
+        if hasattr(self, "_ocr_cache_key") and self._ocr_cache_key == cache_key:
+            return self._ocr_cache
 
         img = Image.open(io.BytesIO(png_bytes))
-
-        # Run Tesseract and get per-word bounding boxes
         data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
 
-        # Group words into lines keyed by (block_num, par_num, line_num)
         lines: dict[tuple[int, int, int], list[dict]] = {}
         n_boxes = len(data["text"])
         for i in range(n_boxes):
@@ -251,6 +242,25 @@ class VisionPipeline:
                 "w": data["width"][i],
                 "h": data["height"][i],
             })
+
+        self._ocr_cache_key = cache_key
+        self._ocr_cache = lines
+        return lines
+
+    def find_text(self, png_bytes: bytes, query: str) -> list[dict]:
+        """Find all occurrences of *query* (case-insensitive substring) on screen.
+
+        Uses pytesseract OCR at native resolution.  Returns a list of match
+        dicts: ``[{"text": str, "cx": int, "cy": int, "x": int, "y": int,
+        "w": int, "h": int}]`` where cx/cy are center coordinates in native
+        screen pixels.
+        """
+        if not _HAS_TESSERACT:
+            print("[vision] pytesseract not installed — OCR disabled. "
+                  "Install with: pip install pytesseract", flush=True)
+            return []
+
+        lines = self._ocr_lines(png_bytes)
 
         query_lower = query.lower()
         matches: list[dict] = []
