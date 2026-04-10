@@ -25,10 +25,11 @@ class PageMemory:
                 changes.append(f"Loaded: {url}")
             else:
                 changes.append(f"Page changed: {self._prev_url} -> {url}")
-        elif diff_ratio < 0.02:
-            changes.append("Page unchanged")
         elif diff_ratio < 0.3:
-            changes.append("Minor page update (modal/dropdown/animation)")
+            # Silent — no URL change and diff is small. Don't claim the page
+            # is "unchanged" since we only measured our own diff threshold,
+            # not what the page actually did. Callers decide how to describe it.
+            pass
 
         self._prev_url = url
         self._prev_title = title

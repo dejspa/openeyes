@@ -221,12 +221,15 @@ def _save_screenshot(jpeg_bytes: bytes, url: str, title: str):
 
 
 def _build_response(img: bytes, crop: bytes | None, context: str,
-                    extra: str = "", diff_ratio: float = 1.0) -> list:
+                    extra: str = "", diff_ratio: float = 1.0,
+                    show_tiny_changes: bool = False) -> list:
     """Build a tool response — smart about what images to include.
 
     - Major change (diff > 0.3) or first load: full screenshot
-    - Minor change (0.05-0.3): crop only (saves tokens)
-    - No change (< 0.02): text only (saves all image tokens)
+    - Moderate change (0.05-0.3): crop only (saves tokens)
+    - Tiny change (< 0.05): text only by default, crop if show_tiny_changes=True
+      (clicks pass show_tiny_changes=True since UI feedback is often subtle:
+      cart badges, button state flips, toasts — all ~1-3% of the page)
     """
     parts = []
     if context:
@@ -235,13 +238,24 @@ def _build_response(img: bytes, crop: bytes | None, context: str,
         parts.append(extra)
     text = "\n\n".join(p for p in parts if p)
 
-    # Decide which images to include based on how much changed
-    if diff_ratio < 0.02:
-        # Nothing changed — text-only response
-        return [text] if text else ["Page unchanged"]
+    # Tiny / no detectable change
+    if diff_ratio < 0.05:
+        if show_tiny_changes and crop and diff_ratio > 0.0:
+            # Subtle UI feedback — show the crop so the model can see
+            # what actually changed.
+            result = [MCPImage(data=crop, format="jpeg")]
+            if text:
+                result.append(
+                    f"{text}\n[Tiny visual change ({diff_ratio:.1%}) — "
+                    f"showing only the changed region.]"
+                )
+            return result
+        # Text-only: no visible change detected (but don't claim "unchanged"
+        # — the page may have changed in ways our diff didn't catch).
+        return [text] if text else [""]
 
-    if crop and 0.05 < diff_ratio < 0.3:
-        # Minor change — send only the crop (smaller = fewer tokens)
+    if crop and diff_ratio < 0.3:
+        # Moderate change — send only the crop (smaller = fewer tokens)
         result = [MCPImage(data=crop, format="jpeg")]
         if text:
             result.append(text + "\n[Showing only the changed area. Use screenshot() for full page.]")
@@ -330,7 +344,7 @@ async def click(x: int, y: int) -> list:
     img, crop, context, diff_ratio = await _capture()
     return _track(_build_response(img, crop, context,
                            f"{desc}\nURL: {browser.current_url}",
-                           diff_ratio))
+                           diff_ratio, show_tiny_changes=True))
 
 
 @mcp.tool()

@@ -167,7 +167,10 @@ class VisionPipeline:
         ratio, bbox = find_changed_region(self._last_screenshot, img)
         self._last_screenshot = img
 
-        if bbox and 0.05 < ratio < 0.7:
+        # Generate a crop for any non-trivial change up to 70% of the page.
+        # Even tiny changes (cart badges, button state flips, toasts) are
+        # worth showing — that's the whole point of vision-first feedback.
+        if bbox and 0.0 < ratio < 0.7:
             cropped = crop_region(img, bbox, padding=50)
             return ratio, image_to_bytes(cropped)
 

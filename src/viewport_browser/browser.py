@@ -39,8 +39,18 @@ _CLICK_SNAP_JS = """
         return el;
     }
 
+    // SVG subtree elements — never return these as the "interactive" hit.
+    // They often inherit cursor:pointer from a parent <button>/<a>, so we
+    // must keep climbing to find the semantic wrapper.
+    const SVG_SUBTREE_TAGS = new Set([
+        'SVG', 'PATH', 'G', 'CIRCLE', 'RECT', 'LINE', 'POLYGON', 'POLYLINE',
+        'ELLIPSE', 'USE', 'DEFS', 'SYMBOL', 'TEXT', 'TSPAN'
+    ]);
+
     function isInteractive(el) {
         if (!el || el === document.body || el === document.documentElement) return false;
+        // SVG children are never "the" interactive element — climb past them.
+        if (SVG_SUBTREE_TAGS.has(el.tagName)) return false;
         if (INTERACTIVE_TAGS.has(el.tagName)) return true;
         const role = el.getAttribute('role');
         if (role && INTERACTIVE_ROLES.has(role)) return true;
@@ -52,14 +62,30 @@ _CLICK_SNAP_JS = """
         return false;
     }
 
+    // "Strong" interactive = has semantic meaning (button/link/input), not
+    // just a cursor:pointer div. We prefer these when climbing.
+    function isStronglyInteractive(el) {
+        if (!el) return false;
+        if (SVG_SUBTREE_TAGS.has(el.tagName)) return false;
+        if (INTERACTIVE_TAGS.has(el.tagName)) return true;
+        const role = el.getAttribute('role');
+        if (role && INTERACTIVE_ROLES.has(role)) return true;
+        return false;
+    }
+
     function findInteractive(startEl) {
         let el = startEl;
-        for (let i = 0; i < 8 && el && el !== document.body; i++) {
-            if (isInteractive(el)) return el;
+        let firstWeak = null;
+        // Climb up to 10 parents looking for the semantic wrapper.
+        for (let i = 0; i < 10 && el && el !== document.body; i++) {
+            if (isStronglyInteractive(el)) return el;
+            if (!firstWeak && isInteractive(el)) firstWeak = el;
             if (el.parentElement) { el = el.parentElement; }
             else { const r = el.getRootNode(); el = r && r.host ? r.host : null; }
         }
-        return null;
+        // No semantic button/link found — fall back to the first weak hit
+        // (cursor:pointer div, onclick handler, etc).
+        return firstWeak;
     }
 
     function describe(el) {
