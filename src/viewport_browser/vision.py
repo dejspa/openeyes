@@ -70,12 +70,16 @@ def image_to_base64(img: Image.Image, format: str = "JPEG", quality: int = 55) -
 
 def find_changed_region(img_a: Image.Image, img_b: Image.Image,
                         grid_size: int = 64, threshold: int = 30) -> tuple[float, dict | None]:
-    """Compare two screenshots. Returns (diff_ratio, changed_bbox or None)."""
+    """Compare two screenshots using RGB channels. Returns (diff_ratio, changed_bbox or None).
+
+    Uses max RGB channel difference instead of grayscale — catches color changes
+    (e.g. red→green button) that grayscale would miss since they have similar luminance.
+    """
     if img_a.size != img_b.size:
         return 1.0, None
 
-    a = img_a.convert("L")
-    b = img_b.convert("L")
+    a = img_a.convert("RGB")
+    b = img_b.convert("RGB")
     w, h = a.size
     pixels_a = list(a.getdata())
     pixels_b = list(b.getdata())
@@ -93,8 +97,10 @@ def find_changed_region(img_a: Image.Image, img_b: Image.Image,
             for cy in range(gy, min(gy + grid_size, h)):
                 for cx in range(gx, min(gx + grid_size, w)):
                     idx = cy * w + cx
+                    pa, pb = pixels_a[idx], pixels_b[idx]
+                    d = max(abs(pa[0] - pb[0]), abs(pa[1] - pb[1]), abs(pa[2] - pb[2]))
                     cell_total += 1
-                    if abs(pixels_a[idx] - pixels_b[idx]) > threshold:
+                    if d > threshold:
                         cell_changed += 1
             if cell_changed > cell_total * 0.1:
                 changed_cells += 1
