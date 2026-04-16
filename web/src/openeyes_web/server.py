@@ -115,24 +115,27 @@ _HISTORY_ROOT = os.path.expanduser("~/.openeyes/web/history")
 def _session_id(ctx: Context | None) -> str:
     """Resolve session ID from MCP context.
 
-    Each SSE connection gets its own ServerSession object, so id(session) is a
-    stable per-connection key. We prefix with the client-provided name (from
-    InitializeRequest) for readability in logs/dashboard, e.g. 'alpha-f82d30'.
-    Falls back to OPENEYES_WEB_SESSION env var (stdio single-client use), then 'default'.
+    Uses the client-provided name from InitializeRequest (e.g. 'claude-code')
+    so the same agent gets the same session — and the same Chrome, cookies,
+    logged-in state — across reconnections. If two parallel instances of the
+    same client need isolation, set OPENEYES_WEB_SESSION in each one's
+    environment to override.
     """
+    override = os.environ.get("OPENEYES_WEB_SESSION")
+    if override:
+        return override
     if ctx is not None:
         sess = getattr(ctx, "session", None)
         if sess is not None:
-            name = "agent"
             cp = getattr(sess, "client_params", None)
             if cp is not None:
                 ci = getattr(cp, "clientInfo", None)
                 if ci is not None and getattr(ci, "name", None):
-                    # sanitize name for use in paths/URLs
                     raw = str(ci.name).strip()
-                    name = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw)[:32] or "agent"
-            return f"{name}-{id(sess) & 0xffffff:06x}"
-    return os.environ.get("OPENEYES_WEB_SESSION", "default")
+                    name = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw)[:32]
+                    if name:
+                        return name
+    return "default"
 
 
 def _load_sessions() -> dict[str, dict]:
