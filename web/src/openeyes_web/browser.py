@@ -187,7 +187,7 @@ class BrowserManager:
             try:
                 urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=1)
                 chrome_running = True
-                print(f"[viewport] Reusing existing Chrome on port {port}", file=sys.stderr)
+                print(f"[openeyes-web] Reusing existing Chrome on port {port}", file=sys.stderr)
             except Exception:
                 pass
 
@@ -231,10 +231,10 @@ class BrowserManager:
                     )
                     time.sleep(0.5)
                     env["DISPLAY"] = self._xvfb_display
-                    print(f"[viewport] Using Xvfb on {self._xvfb_display}", file=sys.stderr)
+                    print(f"[openeyes-web] Using Xvfb on {self._xvfb_display}", file=sys.stderr)
                 else:
                     chrome_args.insert(1, "--headless=new")
-                    print("[viewport] No Xvfb — using --headless=new for CDP", file=sys.stderr)
+                    print("[openeyes-web] No Xvfb — using --headless=new for CDP", file=sys.stderr)
 
                 # Don't store reference — Chrome must outlive this process
                 subprocess.Popen(
@@ -277,7 +277,7 @@ class BrowserManager:
 
             self._context.on("page", self._on_new_page)
 
-            print(f"[viewport] Live browser at http://localhost:{port} ({len(self._pages)} tab(s))", file=sys.stderr)
+            print(f"[openeyes-web] Live browser at http://localhost:{port} ({len(self._pages)} tab(s))", file=sys.stderr)
         else:
             # Standard Playwright launch (no remote viewing)
             self._browser = await self._pw.chromium.launch(
@@ -305,7 +305,7 @@ class BrowserManager:
             except Exception:
                 pass
             url = page.url
-            print(f"[viewport] Auto-closing popup tab: {url[:80]}", file=sys.stderr)
+            print(f"[openeyes-web] Auto-closing popup tab: {url[:80]}", file=sys.stderr)
             try:
                 await page.close()
             except Exception:

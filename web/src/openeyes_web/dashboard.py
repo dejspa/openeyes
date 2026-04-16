@@ -20,7 +20,7 @@ _HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>ViewPort</title>
+<title>OpenEyes Web</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
@@ -80,7 +80,7 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 </style>
 </head>
 <body>
-<div class="hdr"><h1>ViewPort</h1><div style="display:flex;align-items:center;gap:12px"><select id="modelSel" onchange="setActiveModel(this.value)" style="background:#22252f;color:#e0e0e0;border:1px solid #333;padding:4px 8px;border-radius:4px;font-size:12px"></select><div class="st" id="st"><span class="dot off"></span>Connecting...</div></div></div>
+<div class="hdr"><h1>OpenEyes Web</h1><div style="display:flex;align-items:center;gap:12px"><select id="modelSel" onchange="setActiveModel(this.value)" style="background:#22252f;color:#e0e0e0;border:1px solid #333;padding:4px 8px;border-radius:4px;font-size:12px"></select><div class="st" id="st"><span class="dot off"></span>Connecting...</div></div></div>
 <div class="grid" id="grid"></div>
 <div class="mt" id="mt"><h2>No active browser sessions</h2><p>Sessions appear when an agent starts browsing.</p></div>
 <div class="tmod" id="tmod" onclick="if(event.target===this)closeTmod()">
@@ -434,7 +434,7 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == '/api/token-history':
-            log_path = os.path.expanduser("~/.viewport/token-log.jsonl")
+            log_path = os.path.expanduser("~/.openeyes/web/token-log.jsonl")
             entries = []
             try:
                 with open(log_path) as f:
@@ -453,7 +453,7 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == '/api/screenshot-history':
             try:
                 entries = []
-                hist_root = os.path.expanduser("~/.viewport/history")
+                hist_root = os.path.expanduser("~/.openeyes/web/history")
                 for name in sorted(os.listdir(hist_root)) if os.path.isdir(hist_root) else []:
                     hist_dir = os.path.join(hist_root, name)
                     idx = os.path.join(hist_dir, "index.jsonl")
@@ -481,7 +481,7 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             # Serve screenshot files: /screenshots/{dir}/{filename}
             parts = self.path.split('/')
             if len(parts) >= 4:
-                filepath = os.path.join(os.path.expanduser("~/.viewport/history"), parts[2], parts[3])
+                filepath = os.path.join(os.path.expanduser("~/.openeyes/web/history"), parts[2], parts[3])
                 try:
                     with open(filepath, "rb") as f:
                         data = f.read()

@@ -1,7 +1,7 @@
 """Vision pipeline — screenshot preprocessing, coordinate reference, diffing.
 
-Identical approach to viewport_browser/vision.py but standalone
-so desktop-nav has no dependency on Playwright/browser code.
+Identical approach to openeyes_web/vision.py but standalone
+so OpenEyes Desktop has no dependency on Playwright/browser code.
 """
 
 from __future__ import annotations

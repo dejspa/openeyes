@@ -13,7 +13,7 @@ from .tracker import PageMemory
 from .vision import VisionPipeline
 
 mcp = FastMCP(
-    "viewport",
+    "openeyes-web",
     instructions="""\
 Vision-first web browser for navigating websites.
 
@@ -76,16 +76,16 @@ RULES:
 )
 
 # Shared state — lazily initialized, persists across tool calls
-CDP_PORT = int(os.environ.get("VIEWPORT_CDP_PORT", "9222"))
+CDP_PORT = int(os.environ.get("OPENEYES_WEB_CDP_PORT", "9222"))
 
 _browser: BrowserManager | None = None
 _vision: VisionPipeline | None = None
 _memory: PageMemory | None = None
 _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
-_current_model: str = os.environ.get("VIEWPORT_MODEL", "unknown")
-_session = os.environ.get("VIEWPORT_SESSION", "default")
-_TOKEN_FILE = f"/tmp/viewport-tokens-{_session}.json"
-_TOKEN_LOG = os.path.expanduser("~/.viewport/token-log.jsonl")
+_current_model: str = os.environ.get("OPENEYES_WEB_MODEL", "unknown")
+_session = os.environ.get("OPENEYES_WEB_SESSION", "default")
+_TOKEN_FILE = f"/tmp/openeyes-web-tokens-{_session}.json"
+_TOKEN_LOG = os.path.expanduser("~/.openeyes/web/token-log.jsonl")
 
 
 def _track(response: list) -> list:
@@ -141,7 +141,7 @@ def get_token_stats() -> list[dict]:
     import glob
     import json
     result = []
-    for path in glob.glob("/tmp/viewport-tokens-*.json"):
+    for path in glob.glob("/tmp/openeyes-web-tokens-*.json"):
         try:
             with open(path) as f:
                 result.extend(json.load(f))
@@ -171,7 +171,7 @@ def _get_memory() -> PageMemory:
     return _memory
 
 
-_HISTORY_DIR = os.path.expanduser(f"~/.viewport/history/{_session}")
+_HISTORY_DIR = os.path.expanduser(f"~/.openeyes/web/history/{_session}")
 
 async def _capture() -> tuple[bytes, bytes | None, str, float]:
     """Take screenshot, process it.
@@ -283,7 +283,7 @@ _MODEL_RATES: dict[str, float] = {
 
 @mcp.tool()
 async def set_model(model: str) -> str:
-    """Tell viewport which AI model is using it, for accurate cost tracking.
+    """Tell OpenEyes Web which AI model is using it, for accurate cost tracking.
     Call this once at the start of your session.
     Examples: set_model("sonnet-4.5"), set_model("haiku"), set_model("opus")"""
     global _current_model
@@ -488,7 +488,7 @@ def _start_dashboard():
         daemon=True,
     )
     ws_thread.start()
-    print(f"[viewport] Dashboard at http://localhost:{HTTP_PORT}", file=sys.stderr)
+    print(f"[openeyes-web] Dashboard at http://localhost:{HTTP_PORT}", file=sys.stderr)
 
 
 async def _warmup_browser():
@@ -514,8 +514,8 @@ def main():
         mcp.settings.host = "0.0.0.0"
         _start_dashboard()
         asyncio.get_event_loop().run_until_complete(_warmup_browser())
-        print(f"[viewport] MCP server at http://localhost:{mcp.settings.port}/sse", file=sys.stderr)
-        print("[viewport] Ready.", file=sys.stderr)
+        print(f"[openeyes-web] MCP server at http://localhost:{mcp.settings.port}/sse", file=sys.stderr)
+        print("[openeyes-web] Ready.", file=sys.stderr)
 
     mcp.run(transport=transport)
 

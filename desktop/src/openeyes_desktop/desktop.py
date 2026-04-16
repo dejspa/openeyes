@@ -145,8 +145,8 @@ class DesktopController:
         self._last_move: tuple[int, int] | None = None
 
         if self._wsl:
-            self._screenshot_path_win = r"C:\Users\Public\viewport_screenshot.png"
-            self._screenshot_path_wsl = "/mnt/c/Users/Public/viewport_screenshot.png"
+            self._screenshot_path_win = r"C:\Users\Public\openeyes_desktop_screenshot.png"
+            self._screenshot_path_wsl = "/mnt/c/Users/Public/openeyes_desktop_screenshot.png"
             print("[desktop] WSL2 detected — using PowerShell for Windows desktop", file=sys.stderr)
         else:
             self._screenshot_tool: str = ""
@@ -172,8 +172,8 @@ class DesktopController:
             return
 
         # Write init script to file (avoids stdin escaping issues)
-        init_path_wsl = "/mnt/c/Users/Public/viewport_ps_init.ps1"
-        init_path_win = r"C:\Users\Public\viewport_ps_init.ps1"
+        init_path_wsl = "/mnt/c/Users/Public/openeyes_desktop_ps_init.ps1"
+        init_path_win = r"C:\Users\Public\openeyes_desktop_ps_init.ps1"
         with open(init_path_wsl, "w", newline="\r\n") as f:
             f.write(_PS_INIT)
 

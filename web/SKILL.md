@@ -1,5 +1,5 @@
 ---
-name: viewport-browser
+name: openeyes-web
 description: Vision-first web browser — navigate websites, click by coordinates, fill forms, extract text. Uses screenshots + coordinate-based clicking with auto-snap to nearest interactive element.
 version: 1.0.0
 requires:
@@ -7,7 +7,7 @@ requires:
   bins: []
 ---
 
-# Viewport Browser — Vision-First Web Navigation
+# OpenEyes Web — Vision-First Web Navigation
 
 You have access to a browser that lets you navigate websites, click elements, type text, and extract content. Everything is vision-based: you see screenshots and click by (x, y) pixel coordinates.
 
@@ -20,36 +20,36 @@ The browser runs as an MCP server. Connect using one of these methods:
 ```json
 {
   "mcpServers": {
-    "viewport": {
-      "command": "viewport-browser",
+    "openeyes-web": {
+      "command": "openeyes-web",
       "transport": "stdio"
     }
   }
 }
 ```
 
-### SSE / HTTP (OpenClaw, remote agents)
+### SSE / HTTP (remote agents)
 
 Start the server first, then connect:
 
 ```bash
-# Start viewport-browser in SSE mode (default port 6090)
-viewport-browser sse
+# Start OpenEyes Web in SSE mode (default port 6090)
+openeyes-web sse
 ```
 
 ```bash
-# OpenClaw
-openclaw mcp set viewport '{"url":"http://localhost:6090/sse"}'
+# Example: OpenClaw
+openclaw mcp set openeyes-web '{"url":"http://localhost:6090/sse"}'
 ```
 
-### Stdio with Python (if viewport-browser is not in PATH)
+### Stdio with Python (if openeyes-web is not in PATH)
 
 ```json
 {
   "mcpServers": {
-    "viewport": {
+    "openeyes-web": {
       "command": "python",
-      "args": ["-m", "viewport_browser.server"]
+      "args": ["-m", "openeyes_web.server"]
     }
   }
 }
@@ -119,4 +119,3 @@ Use `get_text` on interesting items.
 - Don't scroll unnecessarily — check what's already visible first.
 - Don't open product detail pages when the info is already visible on the card.
 - If an overlay or popup blocks you, take a new screenshot — it may have been auto-dismissed.
-

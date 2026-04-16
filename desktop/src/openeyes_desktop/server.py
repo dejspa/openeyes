@@ -22,7 +22,7 @@ from .desktop import DesktopController
 from .vision import VisionPipeline, find_changed_region
 
 mcp = FastMCP(
-    "desktop",
+    "openeyes-desktop",
     instructions="""\
 Vision-first desktop controller. Full computer control through screenshots and input simulation.
 No OS APIs — pure vision, just like a human.
@@ -86,9 +86,9 @@ RULES:
 _desktop: DesktopController | None = None
 _vision: VisionPipeline | None = None
 _grid_labels: dict[str, tuple[int, int]] = {}  # label -> (img_x, img_y)
-_session = os.environ.get("VIEWPORT_SESSION", "default")
-_VIEWPORT_DIR = os.path.expanduser("~/.viewport")
-_HISTORY_DIR = os.path.expanduser(f"~/.viewport/history/desktop-{_session}")
+_session = os.environ.get("OPENEYES_DESKTOP_SESSION", "default")
+_OPENEYES_DIR = os.path.expanduser("~/.openeyes/desktop")
+_HISTORY_DIR = os.path.expanduser(f"~/.openeyes/desktop/history/{_session}")
 
 
 def _get_desktop() -> DesktopController:
@@ -142,10 +142,10 @@ def _save_screenshot(jpeg_bytes: bytes):
 
     # Write latest screenshot + metadata for dashboard polling
     try:
-        os.makedirs(_VIEWPORT_DIR, exist_ok=True)
-        with open(os.path.join(_VIEWPORT_DIR, f"desktop-{_session}.jpg"), "wb") as f:
+        os.makedirs(_OPENEYES_DIR, exist_ok=True)
+        with open(os.path.join(_OPENEYES_DIR, f"desktop-{_session}.jpg"), "wb") as f:
             f.write(jpeg_bytes)
-        with open(os.path.join(_VIEWPORT_DIR, f"desktop-{_session}.json"), "w") as f:
+        with open(os.path.join(_OPENEYES_DIR, f"desktop-{_session}.json"), "w") as f:
             json.dump({
                 "session": _session,
                 "ts": datetime.now(timezone.utc).isoformat(),
