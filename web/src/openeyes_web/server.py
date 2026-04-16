@@ -67,6 +67,12 @@ STRATEGY GUIDE — follow these patterns for best results:
 4. BROWSE FEED (e.g. "scroll through feed, find articles about X"):
    screenshot → scroll → screenshot → scroll (repeat). Use get_text on interesting items.
 
+5. PARALLEL WORK (e.g. "compare X on site A vs site B", "research multiple topics",
+   "keep gp.se open while also checking willys.se"):
+   new_tab("https://a.com") → work there → new_tab("https://b.com") → work there →
+   switch_tab(0) to return to the first. Tabs persist across calls — open as many as
+   you need, one per site/topic. Use list_tabs() to see what's already open.
+
 PRODUCT SELECTION — think like a human:
 - "fryst lax" means salmon fillets, NOT salmon burgers or salmon sausage.
 - "potatis" means whole potatoes, NOT potato chips or potato salad.
@@ -79,6 +85,8 @@ RULES:
 - Don't scroll unnecessarily — check what's already visible first.
 - Don't open product detail modals when the info is already on the product card.
 - If an overlay or popup blocks you, take a new screenshot — it may have been auto-dismissed.
+- Use new_tab whenever you start work on a different site or topic — don't navigate away
+  from a useful tab. You can have many tabs open simultaneously and switch between them.
 """,
 )
 
