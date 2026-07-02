@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import http.server
 import json
 import os
 import sys
 import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import websockets
 
@@ -16,6 +19,19 @@ CDP_PORT = 9222  # fallback when no session file exists (pre-multisession deploy
 HTTP_PORT = 6080
 WS_PORT = 6081
 SESSION_FILE = "/tmp/openeyes-web-sessions.json"
+HISTORY_ROOT = os.path.expanduser("~/.openeyes/web/history")
+
+
+@contextmanager
+def _session_lock():
+    """Same flock the MCP server uses — the session file is shared across processes."""
+    lf = open(SESSION_FILE + ".lock", "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
 
 
 def _load_sessions() -> dict:
@@ -130,13 +146,20 @@ body{background:#0f1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFo
 const WS_PORT = __WS_PORT__;
 const S={};let fid=null;
 const DEFAULT_MODELS=[
-  {name:'Haiku 4.5',rate:0.8},{name:'Sonnet 4.5',rate:3},{name:'Opus 4',rate:15},
+  {name:'Fable 5',rate:10},{name:'Opus 4.8',rate:5},{name:'Sonnet 5',rate:3},{name:'Haiku 4.5',rate:1},
   {name:'GPT-4o',rate:2.5},{name:'GPT-4o mini',rate:0.15},{name:'Gemini 2.5 Pro',rate:1.25}
 ];
 let MODELS=DEFAULT_MODELS.map(m=>({...m}));
 let activeModel=0;
+const userCustomizedModels=!!localStorage.getItem('vp-models');
 try{const s=localStorage.getItem('vp-models');if(s)MODELS=JSON.parse(s);}catch(e){}
 try{const a=localStorage.getItem('vp-active-model');if(a!==null)activeModel=parseInt(a);}catch(e){}
+// Server is the source of truth for pricing unless the user edited rates locally.
+if(!userCustomizedModels){
+  fetch('/api/models').then(r=>r.json()).then(list=>{
+    if(Array.isArray(list)&&list.length){MODELS=list;initModelSel();}
+  }).catch(()=>{});
+}
 function setActiveModel(i){activeModel=parseInt(i);localStorage.setItem('vp-active-model',activeModel);}
 function initModelSel(){
   const sel=document.getElementById('modelSel');
@@ -526,25 +549,32 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
                         "active": False,
                     })
                 sessions.sort(key=lambda r: -(r["last_active"] or 0))
-            # Ping each port; reap dead sessions from the session file.
-            persisted = _load_sessions()
-            live = []
-            reaped = False
-            for s in sessions:
-                port = s.get("port")
-                if port is None:
-                    continue
+            # Ping each port concurrently; reap dead sessions from the session file.
+            def _ping(port):
                 try:
                     urllib.request.urlopen(f'http://localhost:{port}/json/version', timeout=0.3)
-                    live.append(s)
+                    return True
                 except Exception:
-                    if s["id"] in persisted:
-                        persisted.pop(s["id"])
-                        reaped = True
-            if reaped:
+                    return False
+
+            pingable = [s for s in sessions if s.get("port") is not None]
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                alive = list(pool.map(_ping, [s["port"] for s in pingable]))
+            live = [s for s, ok in zip(pingable, alive) if ok]
+            dead_ids = [s["id"] for s, ok in zip(pingable, alive) if not ok]
+            if dead_ids:
                 try:
-                    with open(SESSION_FILE, "w") as f:
-                        json.dump(persisted, f)
+                    with _session_lock():
+                        persisted = _load_sessions()
+                        reaped = False
+                        for sid in dead_ids:
+                            if persisted.pop(sid, None) is not None:
+                                reaped = True
+                        if reaped:
+                            tmp = SESSION_FILE + ".tmp"
+                            with open(tmp, "w") as f:
+                                json.dump(persisted, f)
+                            os.replace(tmp, SESSION_FILE)
                 except Exception:
                     pass
             # Back-compat: if nothing is persisted but the legacy CDP port is up, show it.
@@ -642,10 +672,18 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path.startswith('/screenshots/'):
-            # Serve screenshot files: /screenshots/{dir}/{filename}
-            parts = self.path.split('/')
+            # Serve screenshot files: /screenshots/{dir}/{filename}.
+            # Resolve and confine to the history root — this endpoint is
+            # network-reachable, so reject any traversal out of it.
+            from urllib.parse import unquote
+            parts = unquote(self.path).split('/')
+            filepath = None
             if len(parts) >= 4:
-                filepath = os.path.join(os.path.expanduser("~/.openeyes/web/history"), parts[2], parts[3])
+                root = os.path.realpath(HISTORY_ROOT)
+                candidate = os.path.realpath(os.path.join(root, parts[2], parts[3]))
+                if candidate.startswith(root + os.sep) and candidate.endswith('.jpg'):
+                    filepath = candidate
+            if filepath:
                 try:
                     with open(filepath, "rb") as f:
                         data = f.read()
@@ -661,6 +699,18 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_response(404)
                 self.end_headers()
+        elif self.path == '/api/models':
+            # Model pricing — single source of truth lives in server._MODEL_RATES.
+            try:
+                from .server import get_model_display_list
+                data = json.dumps(get_model_display_list()).encode()
+            except Exception:
+                data = b'[]'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         else:
             self.send_response(404)
             self.end_headers()
@@ -689,9 +739,6 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
 
 
 async def _ws_proxy(ws):
@@ -737,7 +784,10 @@ async def _ws_proxy(ws):
 
 
 def _run_http(port: int):
-    server = http.server.HTTPServer(('0.0.0.0', port), _HTTPHandler)
+    # Threading server — otherwise a slow screenshot download blocks the
+    # 2-second /api/sessions poll and the whole UI stutters.
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', port), _HTTPHandler)
+    server.daemon_threads = True
     server.serve_forever()
 
 

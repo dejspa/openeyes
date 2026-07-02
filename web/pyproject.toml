@@ -8,7 +8,6 @@ dependencies = [
     "playwright>=1.40.0",
     "Pillow>=10.0.0",
     "websockets>=12.0",
-    "pytesseract>=0.3.10",
 ]
 
 [project.scripts]

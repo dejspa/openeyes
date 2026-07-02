@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import base64
 import io
-from PIL import Image, ImageDraw, ImageFont
+import math
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 
 _TICK_FONT: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
@@ -63,9 +63,14 @@ def image_to_bytes(img: Image.Image, format: str = "JPEG", quality: int = 55) ->
     return buf.getvalue()
 
 
-def image_to_base64(img: Image.Image, format: str = "JPEG", quality: int = 55) -> str:
-    """Encode image to base64 string for API calls."""
-    return base64.standard_b64encode(image_to_bytes(img, format, quality)).decode("ascii")
+def estimate_image_tokens(jpeg_bytes: bytes) -> int:
+    """Claude vision cost: ~(width * height) / 750 tokens for the actual image size."""
+    try:
+        with Image.open(io.BytesIO(jpeg_bytes)) as im:
+            w, h = im.size
+        return max(1, math.ceil(w * h / 750))
+    except Exception:
+        return 750
 
 
 def find_changed_region(img_a: Image.Image, img_b: Image.Image,
@@ -74,6 +79,8 @@ def find_changed_region(img_a: Image.Image, img_b: Image.Image,
 
     Uses max RGB channel difference instead of grayscale — catches color changes
     (e.g. red→green button) that grayscale would miss since they have similar luminance.
+    Implemented with PIL C-level ops (ImageChops + BOX downscale) — ~4ms per call
+    vs ~500ms for the equivalent per-pixel Python loop.
     """
     if img_a.size != img_b.size:
         return 1.0, None
@@ -81,37 +88,31 @@ def find_changed_region(img_a: Image.Image, img_b: Image.Image,
     a = img_a.convert("RGB")
     b = img_b.convert("RGB")
     w, h = a.size
-    pixels_a = list(a.getdata())
-    pixels_b = list(b.getdata())
 
-    min_x, min_y = w, h
-    max_x, max_y = 0, 0
-    total_cells = 0
-    changed_cells = 0
+    diff = ImageChops.difference(a, b)
+    r, g, bl = diff.split()
+    max_diff = ImageChops.lighter(ImageChops.lighter(r, g), bl)
+    mask = max_diff.point(lambda v: 255 if v > threshold else 0)
 
-    for gy in range(0, h, grid_size):
-        for gx in range(0, w, grid_size):
-            total_cells += 1
-            cell_changed = 0
-            cell_total = 0
-            for cy in range(gy, min(gy + grid_size, h)):
-                for cx in range(gx, min(gx + grid_size, w)):
-                    idx = cy * w + cx
-                    pa, pb = pixels_a[idx], pixels_b[idx]
-                    d = max(abs(pa[0] - pb[0]), abs(pa[1] - pb[1]), abs(pa[2] - pb[2]))
-                    cell_total += 1
-                    if d > threshold:
-                        cell_changed += 1
-            if cell_changed > cell_total * 0.1:
-                changed_cells += 1
-                min_x = min(min_x, gx)
-                min_y = min(min_y, gy)
-                max_x = max(max_x, gx + grid_size)
-                max_y = max(max_y, gy + grid_size)
+    # BOX-resize of the 0/255 mask computes each grid cell's mean = 255 * fraction
+    # of changed pixels. A cell counts as changed above 10%, matching the old loop.
+    gw, gh = math.ceil(w / grid_size), math.ceil(h / grid_size)
+    cells = list(mask.resize((gw, gh), Image.Resampling.BOX).getdata())
 
-    ratio = changed_cells / total_cells if total_cells > 0 else 1.0
+    min_x = min_y = 10 ** 9
+    max_x = max_y = 0
+    changed = 0
+    for i, v in enumerate(cells):
+        if v > 255 * 0.1:
+            changed += 1
+            gx, gy = (i % gw) * grid_size, (i // gw) * grid_size
+            min_x = min(min_x, gx)
+            min_y = min(min_y, gy)
+            max_x = max(max_x, gx + grid_size)
+            max_y = max(max_y, gy + grid_size)
 
-    if changed_cells == 0:
+    ratio = changed / len(cells) if cells else 1.0
+    if changed == 0:
         return 0.0, None
 
     bbox = {
@@ -134,50 +135,61 @@ def crop_region(img: Image.Image, bbox: dict, padding: int = 50) -> Image.Image:
 class VisionPipeline:
     """Processes screenshots for efficient LLM consumption.
 
-    Downscales to 896x672 (~896x630 actual), JPEG quality 55.
-    Adds subtle coordinate tick marks along edges.
+    One instance per session. Downscales to 896x672 max (typically 896x630 for a
+    1280x900 viewport), JPEG quality 55, subtle coordinate tick marks along edges.
+    Diff baselines are kept per tab (keyed by an opaque tab key) so switching tabs
+    or running sessions concurrently never diffs against the wrong page.
     """
 
     def __init__(self, max_width: int = 896, max_height: int = 672):
         self.max_width = max_width
         self.max_height = max_height
-        self._last_screenshot: Image.Image | None = None
-        self.actual_width: int = max_width
-        self.actual_height: int = max_height
+        self._last: dict[int, Image.Image] = {}  # tab_key -> last downscaled screenshot
+        self.actual_width: int | None = None
+        self.actual_height: int | None = None
 
-    def process(self, png_bytes: bytes) -> bytes:
-        """Process a raw screenshot into a JPEG with coordinate reference.
+    def display_size(self, viewport_w: int, viewport_h: int) -> tuple[int, int]:
+        """Size of the screenshot as the model sees it. Falls back to the thumbnail
+        math when no screenshot has been processed yet (e.g. click before screenshot)."""
+        if self.actual_width and self.actual_height:
+            return self.actual_width, self.actual_height
+        scale = min(self.max_width / viewport_w, self.max_height / viewport_h, 1.0)
+        return round(viewport_w * scale), round(viewport_h * scale)
 
-        Returns JPEG bytes. Sets actual_width/actual_height for coordinate scaling.
+    def analyze(self, png_bytes: bytes, tab_key: int) -> tuple[bytes, bytes | None, float]:
+        """Decode once, diff against this tab's previous screenshot, produce outputs.
+
+        Returns (full_jpeg_with_ticks, crop_jpeg_of_changed_region_or_None, diff_ratio).
         """
         img = Image.open(io.BytesIO(png_bytes))
         img.thumbnail((self.max_width, self.max_height), Image.Resampling.LANCZOS)
+        img = img.convert("RGB")
         self.actual_width = img.width
         self.actual_height = img.height
 
-        img = overlay_coordinate_reference(img)
-        return image_to_bytes(img)
+        prev = self._last.get(tab_key)
+        self._last[tab_key] = img
 
-    def get_change_info(self, png_bytes: bytes) -> tuple[float, bytes | None]:
-        """Compare new screenshot against previous one.
+        crop_jpeg = None
+        if prev is None:
+            ratio = 1.0
+        else:
+            ratio, bbox = find_changed_region(prev, img)
+            # Generate a crop for any non-trivial change up to 70% of the page.
+            # Even tiny changes (cart badges, button state flips, toasts) are
+            # worth showing — that's the whole point of vision-first feedback.
+            if bbox and 0.0 < ratio < 0.7:
+                crop_jpeg = image_to_bytes(crop_region(img, bbox, padding=50))
 
-        Returns (diff_ratio, cropped_jpeg_of_changed_region or None).
-        """
-        img = Image.open(io.BytesIO(png_bytes))
-        img.thumbnail((self.max_width, self.max_height), Image.Resampling.LANCZOS)
+        jpeg = image_to_bytes(overlay_coordinate_reference(img))
+        return jpeg, crop_jpeg, ratio
 
-        if self._last_screenshot is None:
-            self._last_screenshot = img
-            return 1.0, None
+    def forget(self, tab_key: int) -> None:
+        """Drop the diff baseline for a closed tab."""
+        self._last.pop(tab_key, None)
 
-        ratio, bbox = find_changed_region(self._last_screenshot, img)
-        self._last_screenshot = img
-
-        # Generate a crop for any non-trivial change up to 70% of the page.
-        # Even tiny changes (cart badges, button state flips, toasts) are
-        # worth showing — that's the whole point of vision-first feedback.
-        if bbox and 0.0 < ratio < 0.7:
-            cropped = crop_region(img, bbox, padding=50)
-            return ratio, image_to_bytes(cropped)
-
-        return ratio, None
+    def prune(self, live_keys: set[int]) -> None:
+        """Drop baselines for tabs that no longer exist (each is ~1.7MB of RAM)."""
+        for key in list(self._last):
+            if key not in live_keys:
+                del self._last[key]

@@ -11,13 +11,34 @@ import sys
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
+# OPENEYES_WEB_FAST=1 removes the human-mimicking delays (pure latency win on
+# sites that don't fingerprint timing).
+_FAST = os.environ.get("OPENEYES_WEB_FAST", "") == "1"
+
 
 async def _human_delay(min_ms: int = 100, max_ms: int = 400) -> None:
     """Random delay to mimic a fast human — not instant, not slow."""
+    if _FAST:
+        return
     await asyncio.sleep(random.randint(min_ms, max_ms) / 1000)
 
+
+async def _settle(page: Page, timeout_ms: int = 2000) -> None:
+    """Best-effort wait for the network to go quiet so screenshots don't capture
+    half-rendered pages. Swallows the timeout — JS-heavy sites with polling
+    never reach networkidle and that's fine."""
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception:
+        pass
+
 # Click-time snap: find nearest interactive element at (x, y), piercing shadow DOM.
-# Called with {x, y} in viewport coordinates. Returns element info + snapped center.
+# Called with {x, y} in viewport coordinates. Returns element info + click point.
+# On a direct hit the click point is the REQUESTED point (it's already inside the
+# element — clicking the element's center instead can hit a different item when
+# the matched element is a large card/container). Only nearby snaps move the
+# point, and then to the nearest point on the element's rect (verified hittable,
+# falling back to the center).
 _CLICK_SNAP_JS = """
 ({x, y}) => {
     const INTERACTIVE_TAGS = new Set([
@@ -88,7 +109,7 @@ _CLICK_SNAP_JS = """
         return firstWeak;
     }
 
-    function describe(el) {
+    function describe(el, cx, cy) {
         const tag = el.tagName.toLowerCase();
         let type = el.getAttribute('type') || '';
         if (!type && el.getAttribute('contenteditable') === 'true') type = 'contenteditable';
@@ -103,19 +124,30 @@ _CLICK_SNAP_JS = """
         if (!text) {
             text = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 60);
         }
-        const rect = el.getBoundingClientRect();
         return {
             found: true, tag, type, text: text.trim().slice(0, 60),
-            cx: Math.round(rect.x + rect.width / 2),
-            cy: Math.round(rect.y + rect.height / 2),
+            cx: Math.round(cx), cy: Math.round(cy),
         };
     }
 
-    // 1. Direct hit
+    // Click point for a nearby snap: nearest point on the element's rect
+    // (inset 2px), verified to actually hit the element; else its center.
+    function snapPoint(el, px, py) {
+        const rect = el.getBoundingClientRect();
+        const nx = Math.min(Math.max(px, rect.left + 2), rect.right - 2);
+        const ny = Math.min(Math.max(py, rect.top + 2), rect.bottom - 2);
+        const test = deepElementFromPoint(nx, ny);
+        if (test && (test === el || el.contains(test) || findInteractive(test) === el)) {
+            return [nx, ny];
+        }
+        return [rect.x + rect.width / 2, rect.y + rect.height / 2];
+    }
+
+    // 1. Direct hit — click exactly where asked; the point is inside the element.
     const hit = deepElementFromPoint(x, y);
     if (hit) {
         const el = findInteractive(hit);
-        if (el) return {...describe(el), method: 'direct'};
+        if (el) return {...describe(el, x, y), method: 'direct'};
     }
 
     // 2. Spiral search — 8 directions, expanding radius
@@ -127,7 +159,10 @@ _CLICK_SNAP_JS = """
             const el2 = deepElementFromPoint(px, py);
             if (el2) {
                 const interactive = findInteractive(el2);
-                if (interactive) return {...describe(interactive), method: 'nearby', radius: r};
+                if (interactive) {
+                    const [sx, sy] = snapPoint(interactive, x, y);
+                    return {...describe(interactive, sx, sy), method: 'nearby', radius: r};
+                }
             }
         }
     }
@@ -142,15 +177,58 @@ _CLICK_SNAP_JS = """
 }
 """
 
+_GET_TEXT_JS = """
+() => {
+    // Try to find the main article content
+    const selectors = ['article', '[role="main"]', 'main', '.article-body',
+                       '.article-content', '.story-body', '.post-content'];
+    let root = null;
+    for (const sel of selectors) {
+        root = document.querySelector(sel);
+        if (root) break;
+    }
+    if (!root) root = document.body;
+
+    // Structured pass: headings become markdown, text-bearing blocks follow.
+    const parts = [];
+    const els = root.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li, td, th, dt, dd, figcaption, blockquote');
+    for (const el of els) {
+        const text = el.textContent.trim();
+        if (!text || text.length < 5) continue;
+        const tag = el.tagName.toLowerCase();
+        if (tag.startsWith('h')) {
+            parts.push('\\n## ' + text);
+        } else {
+            parts.push(text);
+        }
+    }
+    let out = parts.join('\\n');
+
+    // Product grids and app-like pages render names/prices in divs/spans that
+    // the structured pass misses entirely. If it came back thin, fall back to
+    // the page's visible text (innerText respects CSS visibility).
+    if (out.length < 200) {
+        out = (root.innerText || document.body.innerText || '').trim();
+    }
+
+    const LIMIT = 8000;
+    if (out.length > LIMIT) {
+        return out.slice(0, LIMIT) + '\\n\\n[Truncated — showing ' + LIMIT + ' of ' + out.length + ' characters. Scroll or navigate to a more specific page for the rest.]';
+    }
+    return out;
+}
+"""
+
 
 class BrowserManager:
     """Manages a Chromium instance with multiple tabs.
 
     Environment variables:
-        HEADED=1        — show the browser window on the desktop
-        CDP_PORT=9222   — expose Chrome DevTools Protocol on this port;
-                          connect from any browser to see/interact live
-        SLOW_MO=300     — delay (ms) between Playwright actions
+        HEADED=1              — show the browser window on the desktop
+        CDP_PORT=9222         — expose Chrome DevTools Protocol on this port;
+                                connect from any browser to see/interact live
+        SLOW_MO=300           — delay (ms) between Playwright actions
+        OPENEYES_WEB_FAST=1   — skip human-mimicking delays
     """
 
     def __init__(self, viewport_width: int = 1280, viewport_height: int = 900,
@@ -282,11 +360,13 @@ class BrowserManager:
                 self._active = len(pages) - 1
                 for page in self._pages:
                     await page.set_viewport_size({"width": self._vw, "height": self._vh})
+                    self._watch_page(page)
             else:
                 page = await self._context.new_page()
                 await page.set_viewport_size({"width": self._vw, "height": self._vh})
                 self._pages = [page]
                 self._active = 0
+                self._watch_page(page)
 
             self._context.on("page", self._on_new_page)
 
@@ -304,9 +384,27 @@ class BrowserManager:
             page = await self._context.new_page()
             self._pages = [page]
             self._active = 0
+            self._watch_page(page)
             self._context.on("page", self._on_new_page)
 
         return self._pages[self._active]
+
+    def _watch_page(self, page: Page) -> None:
+        """Keep _pages in sync when a tab is closed externally (dashboard close
+        button, window.close(), crash) — otherwise the next screenshot targets
+        a dead page and throws a raw Playwright error at the agent."""
+        page.on("close", lambda: self._forget_page(page))
+
+    def _forget_page(self, page: Page) -> None:
+        if page not in self._pages:
+            return  # already removed by close_tab()
+        i = self._pages.index(page)
+        self._pages.pop(i)
+        self._pins.pop(id(page), None)
+        if i < self._active:
+            self._active -= 1
+        if self._active >= len(self._pages):
+            self._active = max(0, len(self._pages) - 1)
 
     def _on_new_page(self, page) -> None:
         """Auto-close popup tabs unless opened intentionally via new_tab()."""
@@ -334,6 +432,17 @@ class BrowserManager:
     @property
     def viewport_size(self) -> tuple[int, int]:
         return (self._vw, self._vh)
+
+    @property
+    def active_tab_key(self) -> int:
+        """Opaque key for the active tab — used for per-tab vision/memory state."""
+        if not self._pages:
+            return 0
+        return id(self._pages[self._active])
+
+    @property
+    def live_tab_keys(self) -> set[int]:
+        return {id(p) for p in self._pages}
 
     # --- Tab management ---
 
@@ -374,6 +483,7 @@ class BrowserManager:
                     if existing == domain:
                         self._active = i
                         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await _settle(page)
                         await _human_delay(300, 700)
                         return self._active
 
@@ -383,18 +493,22 @@ class BrowserManager:
         await page.set_viewport_size({"width": self._vw, "height": self._vh})
         self._pages.append(page)
         self._active = len(self._pages) - 1
+        self._watch_page(page)
         if pin:
             self._pins[id(page)] = pin
         if url and url != "about:blank":
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await _settle(page)
             await _human_delay(300, 700)
         return self._active
 
-    async def switch_tab(self, index: int) -> None:
-        """Switch to tab by index."""
-        if 0 <= index < len(self._pages):
-            self._active = index
-            await self._pages[index].bring_to_front()
+    async def switch_tab(self, index: int) -> str | None:
+        """Switch to tab by index. Returns error message if the index is invalid."""
+        if not (0 <= index < len(self._pages)):
+            return f"No tab at index {index} — valid indices: 0..{len(self._pages) - 1}"
+        self._active = index
+        await self._pages[index].bring_to_front()
+        return None
 
     def list_tabs(self) -> list[dict]:
         """List all open tabs with index, url, pin name, and active status."""
@@ -412,6 +526,8 @@ class BrowserManager:
         """Close a tab. Pinned tabs are protected. Closing the last tab leaves
         no pages — the caller is expected to tear down the session.
         Returns error message if refused, None on success."""
+        if not (0 <= index < len(self._pages)):
+            return f"No tab at index {index} — valid indices: 0..{len(self._pages) - 1}"
         page = self._pages[index]
         pin = self._pins.get(id(page))
         if pin:
@@ -449,6 +565,7 @@ class BrowserManager:
 
         page = self._pages[self._active]
         await page.goto(url, wait_until=wait_until, timeout=30000)
+        await _settle(page)
         await _human_delay(300, 700)
         return "Navigated"
 
@@ -465,41 +582,18 @@ class BrowserManager:
             )
 
     async def get_page_text(self) -> str:
-        """Extract the main text content of the page (article body, headings, paragraphs)."""
+        """Extract the visible text content of the page. Structured (headings as
+        markdown) when the page has article-style markup; falls back to visible
+        innerText for app-like pages (product grids, dashboards)."""
         page = await self._ensure_browser()
-        return await page.evaluate("""
-        () => {
-            // Try to find the main article content
-            const selectors = ['article', '[role="main"]', 'main', '.article-body',
-                               '.article-content', '.story-body', '.post-content'];
-            let root = null;
-            for (const sel of selectors) {
-                root = document.querySelector(sel);
-                if (root) break;
-            }
-            if (!root) root = document.body;
-
-            const parts = [];
-            const els = root.querySelectorAll('h1, h2, h3, h4, p, li, figcaption, blockquote');
-            for (const el of els) {
-                const text = el.textContent.trim();
-                if (!text || text.length < 5) continue;
-                const tag = el.tagName.toLowerCase();
-                if (tag.startsWith('h')) {
-                    parts.push('\\n## ' + text);
-                } else {
-                    parts.push(text);
-                }
-            }
-            return parts.join('\\n').slice(0, 8000);
-        }
-        """)
+        return await page.evaluate(_GET_TEXT_JS)
 
     async def click_at_point(self, x: int, y: int) -> dict:
         """Click near (x, y) with snap-to-interactive-element.
 
         Uses elementFromPoint (pierces shadow DOM) to find the nearest
-        interactive element and clicks its center. Returns info about
+        interactive element. Direct hits click the requested point; nearby
+        snaps click the nearest point on the element. Returns info about
         what was clicked: {found, cx, cy, tag, type, text, method}.
         """
         page = await self._ensure_browser()
@@ -508,28 +602,18 @@ class BrowserManager:
         await _human_delay(150, 400)
         return result
 
-    async def click(self, x: int, y: int) -> None:
-        """Raw click at exact viewport coordinates (no snap)."""
-        page = await self._ensure_browser()
-        await page.mouse.click(x, y)
-        await _human_delay(150, 400)
-
     async def type_text(self, text: str, press_enter: bool = False,
                         clear_first: bool = False) -> None:
         page = await self._ensure_browser()
         if clear_first:
             await page.keyboard.press("Control+a")
             await _human_delay(50, 150)
-        await page.keyboard.type(text, delay=random.randint(20, 50))
+        await page.keyboard.type(text, delay=0 if _FAST else random.randint(20, 50))
         if press_enter:
             await _human_delay(100, 300)
             await page.keyboard.press("Enter")
+            await _settle(page, timeout_ms=1500)
             await _human_delay(300, 600)
-
-    async def press_key(self, key: str) -> None:
-        page = await self._ensure_browser()
-        await page.keyboard.press(key)
-        await _human_delay(100, 300)
 
     async def scroll(self, direction: str = "down", amount: int = 3) -> None:
         page = await self._ensure_browser()
@@ -540,6 +624,7 @@ class BrowserManager:
     async def back(self) -> None:
         page = await self._ensure_browser()
         await page.go_back(timeout=10000)
+        await _settle(page)
         await _human_delay(200, 500)
 
     async def get_page_title(self) -> str:

@@ -8,16 +8,18 @@ Sessions inactive > 48h are auto-cleaned (Chrome killed, state kept).
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 
 from mcp.server.fastmcp import FastMCP, Context, Image as MCPImage
 
 from .browser import BrowserManager
 from .tracker import PageMemory
-from .vision import VisionPipeline
+from .vision import VisionPipeline, estimate_image_tokens
 
 mcp = FastMCP(
     "openeyes-web",
@@ -97,11 +99,12 @@ RULES:
 _BASE_CDP_PORT = int(os.environ.get("OPENEYES_WEB_CDP_PORT", "9222"))
 _TTL_SECONDS = 48 * 3600
 _CLEANUP_INTERVAL = 1800  # 30 min
+_HISTORY_RETENTION_DAYS = 14
 _SESSION_FILE = "/tmp/openeyes-web-sessions.json"
 
 _browsers: dict[str, BrowserManager] = {}
-_vision: VisionPipeline | None = None
-_memory: PageMemory | None = None
+_vision: dict[str, VisionPipeline] = {}
+_memory: dict[str, PageMemory] = {}
 _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
 _current_model: str = os.environ.get("OPENEYES_WEB_MODEL", "unknown")
 _session_ports: dict[str, int] = {}  # session_id -> CDP port
@@ -110,6 +113,14 @@ _cleanup_started = False
 
 _TOKEN_LOG = os.path.expanduser("~/.openeyes/web/token-log.jsonl")
 _HISTORY_ROOT = os.path.expanduser("~/.openeyes/web/history")
+
+
+def _bg(fn) -> None:
+    """Run a small blocking I/O job off the event loop (fire and forget)."""
+    try:
+        asyncio.get_running_loop().run_in_executor(None, fn)
+    except RuntimeError:
+        fn()  # no running loop (sync context) — just do it
 
 
 def _session_id(ctx: Context | None) -> str:
@@ -138,6 +149,19 @@ def _session_id(ctx: Context | None) -> str:
     return "default"
 
 
+# --- Session file: shared across processes, so guard read-modify-write with flock ---
+
+@contextmanager
+def _session_lock():
+    lf = open(_SESSION_FILE + ".lock", "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
+
 def _load_sessions() -> dict[str, dict]:
     try:
         with open(_SESSION_FILE) as f:
@@ -147,41 +171,58 @@ def _load_sessions() -> dict[str, dict]:
 
 
 def _save_sessions(data: dict[str, dict]) -> None:
+    """Atomic write — readers in other processes never see a partial file."""
     try:
-        with open(_SESSION_FILE, "w") as f:
+        tmp = _SESSION_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f)
+        os.replace(tmp, _SESSION_FILE)
     except Exception:
         pass
 
 
 def _update_session_record(session_id: str, port: int, chrome_pid: int | None = None) -> None:
-    data = _load_sessions()
-    rec = data.get(session_id, {})
-    rec["port"] = port
-    rec["last_active"] = time.time()
-    if chrome_pid is not None:
-        rec["chrome_pid"] = chrome_pid
-    data[session_id] = rec
-    _save_sessions(data)
+    with _session_lock():
+        data = _load_sessions()
+        rec = data.get(session_id, {})
+        rec["port"] = port
+        rec["last_active"] = time.time()
+        if chrome_pid is not None:
+            rec["chrome_pid"] = chrome_pid
+        data[session_id] = rec
+        _save_sessions(data)
+
+
+def _remove_session_record(session_id: str) -> None:
+    with _session_lock():
+        data = _load_sessions()
+        if data.pop(session_id, None) is not None:
+            _save_sessions(data)
 
 
 def _allocate_port(session_id: str) -> int:
-    """Return a CDP port for this session, allocating a fresh one if needed."""
+    """Return a CDP port for this session, allocating a fresh one if needed.
+
+    The reservation is persisted immediately under the file lock so two MCP
+    processes can't hand out the same port concurrently."""
     if session_id in _session_ports:
         return _session_ports[session_id]
-    persisted = _load_sessions()
-    if session_id in persisted:
-        port = persisted[session_id]["port"]
-        _session_ports[session_id] = port
-        return port
-    used = set(_session_ports.values()) | {r["port"] for r in persisted.values()}
-    # "default" always gets the base port (back-compat with single-session deployments)
-    if session_id == "default" and _BASE_CDP_PORT not in used:
-        port = _BASE_CDP_PORT
-    else:
-        port = _BASE_CDP_PORT
-        while port in used:
-            port += 1
+    with _session_lock():
+        persisted = _load_sessions()
+        if session_id in persisted:
+            port = persisted[session_id]["port"]
+            _session_ports[session_id] = port
+            return port
+        used = set(_session_ports.values()) | {r["port"] for r in persisted.values()}
+        # "default" always gets the base port (back-compat with single-session deployments)
+        if session_id == "default" and _BASE_CDP_PORT not in used:
+            port = _BASE_CDP_PORT
+        else:
+            port = _BASE_CDP_PORT
+            while port in used:
+                port += 1
+        persisted[session_id] = {"port": port, "last_active": time.time()}
+        _save_sessions(persisted)
     _session_ports[session_id] = port
     return port
 
@@ -199,7 +240,9 @@ def _track(response: list, session_id: str) -> list:
     tokens = 0
     for part in response:
         if isinstance(part, MCPImage):
-            tokens += 1500  # ~896x630 JPEG ≈ 1500 Claude vision tokens
+            # Claude vision cost scales with actual image size — crops are far
+            # cheaper than full screenshots, so size each image individually.
+            tokens += estimate_image_tokens(part.data)
         elif isinstance(part, str):
             tokens += max(1, len(part) // 4)
     browser = _browsers.get(session_id)
@@ -221,28 +264,37 @@ def _write_token_stats(session_id: str) -> None:
          "model": _current_model, "session": session_id}
         for page in browser._pages
     ]
-    try:
-        with open(_token_file(session_id), "w") as f:
-            json.dump(stats, f)
-    except Exception:
-        pass
+    payload = json.dumps(stats)
+    path = _token_file(session_id)
+
+    def _write():
+        try:
+            with open(path, "w") as f:
+                f.write(payload)
+        except Exception:
+            pass
+    _bg(_write)
 
 
 def _append_token_log(session_id: str, url: str, tokens: int) -> None:
     """Append token usage to persistent log (never rotated — kept for historical reporting)."""
     from datetime import datetime, timezone
-    try:
-        os.makedirs(os.path.dirname(_TOKEN_LOG), exist_ok=True)
-        with open(_TOKEN_LOG, "a") as f:
-            f.write(json.dumps({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "url": url,
-                "tokens": tokens,
-                "model": _current_model,
-                "session": session_id,
-            }) + "\n")
-    except Exception:
-        pass
+    line = json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "url": url,
+        "tokens": tokens,
+        "model": _current_model,
+        "session": session_id,
+    }) + "\n"
+
+    def _write():
+        try:
+            os.makedirs(os.path.dirname(_TOKEN_LOG), exist_ok=True)
+            with open(_TOKEN_LOG, "a") as f:
+                f.write(line)
+        except Exception:
+            pass
+    _bg(_write)
 
 
 def get_token_stats() -> list[dict]:
@@ -276,6 +328,10 @@ def get_sessions() -> list[dict]:
     return result
 
 
+_port_alive_at: dict[int, float] = {}  # port -> monotonic time last confirmed alive
+_PORT_ALIVE_TTL = 3.0
+
+
 def _port_alive(port: int) -> bool:
     """Quick check — is Chrome still listening on this CDP port?"""
     import urllib.request
@@ -284,6 +340,27 @@ def _port_alive(port: int) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _port_alive_async(port: int) -> bool:
+    """Cached, off-loop aliveness check. Positive results are cached briefly so
+    every tool call doesn't pay a blocking HTTP round-trip; negatives are never
+    cached (Chrome may be mid-launch)."""
+    now = time.monotonic()
+    if now - _port_alive_at.get(port, float("-inf")) < _PORT_ALIVE_TTL:
+        return True
+    alive = await asyncio.to_thread(_port_alive, port)
+    if alive:
+        _port_alive_at[port] = now
+    return alive
+
+
+def _drop_session_state(session_id: str) -> None:
+    _browsers.pop(session_id, None)
+    _vision.pop(session_id, None)
+    _memory.pop(session_id, None)
+    _session_ports.pop(session_id, None)
+    _last_active.pop(session_id, None)
 
 
 async def _get_browser(session_id: str) -> BrowserManager:
@@ -295,20 +372,18 @@ async def _get_browser(session_id: str) -> BrowserManager:
         port = _session_ports.get(session_id)
         # Chrome may have died since last call (e.g. user closed all tabs via dashboard).
         # Drop the stale BrowserManager and fall through to re-launch a fresh Chrome.
-        if port is None or not _port_alive(port):
-            stale = _browsers.pop(session_id, None)
+        if port is None or not await _port_alive_async(port):
+            stale = _browsers.get(session_id)
+            _drop_session_state(session_id)
             if stale:
                 try:
                     await stale.close()
                 except Exception:
                     pass
             # Also reap the persisted record — port stays the same on recreate.
-            data = _load_sessions()
-            data.pop(session_id, None)
-            _save_sessions(data)
-            _session_ports.pop(session_id, None)
+            _remove_session_record(session_id)
         else:
-            _update_session_record(session_id, port)
+            _bg(lambda: _update_session_record(session_id, port))
             if not _cleanup_started:
                 asyncio.create_task(_cleanup_loop())
                 _cleanup_started = True
@@ -329,18 +404,16 @@ async def _get_browser(session_id: str) -> BrowserManager:
     return browser
 
 
-def _get_vision() -> VisionPipeline:
-    global _vision
-    if _vision is None:
-        _vision = VisionPipeline()
-    return _vision
+def _get_vision(session_id: str) -> VisionPipeline:
+    if session_id not in _vision:
+        _vision[session_id] = VisionPipeline()
+    return _vision[session_id]
 
 
-def _get_memory() -> PageMemory:
-    global _memory
-    if _memory is None:
-        _memory = PageMemory()
-    return _memory
+def _get_memory(session_id: str) -> PageMemory:
+    if session_id not in _memory:
+        _memory[session_id] = PageMemory()
+    return _memory[session_id]
 
 
 async def _capture(session_id: str) -> tuple[bytes, bytes | None, str, float]:
@@ -349,16 +422,21 @@ async def _capture(session_id: str) -> tuple[bytes, bytes | None, str, float]:
     Returns (jpeg_bytes, crop_jpeg_or_none, context, diff_ratio).
     """
     browser = await _get_browser(session_id)
-    vision = _get_vision()
-    memory = _get_memory()
+    vision = _get_vision(session_id)
+    memory = _get_memory(session_id)
 
     png = await browser.screenshot_bytes()
-    diff_ratio, crop_jpeg = vision.get_change_info(png)
-    jpeg_bytes = vision.process(png)
+    tab_key = browser.active_tab_key
+    # Decode/diff/encode is ~50ms of CPU — keep it off the event loop.
+    jpeg_bytes, crop_jpeg, diff_ratio = await asyncio.to_thread(vision.analyze, png, tab_key)
 
     url = browser.current_url
     title = await browser.get_page_title()
-    context = memory.update(url, title, diff_ratio)
+    context = memory.update(tab_key, url, diff_ratio)
+
+    live = browser.live_tab_keys
+    vision.prune(live)
+    memory.prune(live)
 
     _save_screenshot(session_id, jpeg_bytes, url, title)
 
@@ -366,26 +444,29 @@ async def _capture(session_id: str) -> tuple[bytes, bytes | None, str, float]:
 
 
 def _save_screenshot(session_id: str, jpeg_bytes: bytes, url: str, title: str) -> None:
-    """Save screenshot to disk for history browsing (per-session dir)."""
+    """Save screenshot to disk for history browsing (per-session dir, off-loop)."""
     from datetime import datetime, timezone
-    try:
-        hist = _history_dir(session_id)
-        os.makedirs(hist, exist_ok=True)
-        ts = datetime.now(timezone.utc)
-        filename = f"{ts.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-        filepath = os.path.join(hist, filename)
-        with open(filepath, "wb") as f:
-            f.write(jpeg_bytes)
-        with open(os.path.join(hist, "index.jsonl"), "a") as f:
-            f.write(json.dumps({
-                "ts": ts.isoformat(),
-                "file": filename,
-                "url": url,
-                "title": title,
-                "session": session_id,
-            }) + "\n")
-    except Exception:
-        pass
+    ts = datetime.now(timezone.utc)
+    hist = _history_dir(session_id)
+    filename = f"{ts.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+    line = json.dumps({
+        "ts": ts.isoformat(),
+        "file": filename,
+        "url": url,
+        "title": title,
+        "session": session_id,
+    }) + "\n"
+
+    def _write():
+        try:
+            os.makedirs(hist, exist_ok=True)
+            with open(os.path.join(hist, filename), "wb") as f:
+                f.write(jpeg_bytes)
+            with open(os.path.join(hist, "index.jsonl"), "a") as f:
+                f.write(line)
+        except Exception:
+            pass
+    _bg(_write)
 
 
 def _build_response(img: bytes, crop: bytes | None, context: str,
@@ -437,15 +518,17 @@ def _build_response(img: bytes, crop: bytes | None, context: str,
 
 
 # ---------------------------------------------------------------------------
-# TTL cleanup
+# TTL cleanup + history retention
 # ---------------------------------------------------------------------------
 
 async def _cleanup_loop() -> None:
-    """Background task: every _CLEANUP_INTERVAL seconds, close sessions idle > _TTL_SECONDS."""
+    """Background task: every _CLEANUP_INTERVAL seconds, close sessions idle > _TTL_SECONDS
+    and sweep screenshot history older than _HISTORY_RETENTION_DAYS."""
     while True:
         try:
             await asyncio.sleep(_CLEANUP_INTERVAL)
             await _cleanup_expired()
+            await asyncio.to_thread(_sweep_history)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -456,56 +539,119 @@ async def _cleanup_expired() -> None:
     """Close any session whose last_active is older than TTL. Chrome killed, logs kept."""
     now = time.time()
     data = _load_sessions()
-    changed = False
+    expired = [sid for sid, rec in data.items()
+               if rec.get("last_active", 0) and (now - rec["last_active"]) > _TTL_SECONDS]
 
-    for sid, rec in list(data.items()):
-        last = rec.get("last_active", 0)
-        if last and (now - last) > _TTL_SECONDS:
-            browser = _browsers.pop(sid, None)
-            pid = rec.get("chrome_pid")
-            if browser:
+    for sid in expired:
+        rec = data[sid]
+        browser = _browsers.get(sid)
+        pid = rec.get("chrome_pid")
+        if browser:
+            try:
+                await browser.close(kill_chrome=True)
+            except Exception as e:
+                print(f"[openeyes-web] Failed to close session {sid}: {e}", file=sys.stderr)
+        elif pid:
+            # Session known from persisted state but no BrowserManager in memory
+            # (e.g., server restarted). Kill Chrome directly.
+            import signal
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                print(f"[openeyes-web] Failed to kill pid {pid} for session {sid}: {e}", file=sys.stderr)
+        _drop_session_state(sid)
+        _remove_session_record(sid)
+        print(f"[openeyes-web] Reclaimed idle session '{sid}' (idle {int(now - rec.get('last_active', 0))}s)", file=sys.stderr)
+
+
+def _sweep_history() -> None:
+    """Delete screenshot history older than the retention window and prune the
+    per-session index files. Screenshots pile up at ~30-80KB per agent action."""
+    cutoff = time.time() - _HISTORY_RETENTION_DAYS * 86400
+    if not os.path.isdir(_HISTORY_ROOT):
+        return
+    for name in os.listdir(_HISTORY_ROOT):
+        sess_dir = os.path.join(_HISTORY_ROOT, name)
+        if not os.path.isdir(sess_dir):
+            continue
+        removed: set[str] = set()
+        for fname in os.listdir(sess_dir):
+            if not fname.endswith(".jpg"):
+                continue
+            path = os.path.join(sess_dir, fname)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed.add(fname)
+            except OSError:
+                pass
+        if not removed:
+            continue
+        idx = os.path.join(sess_dir, "index.jsonl")
+        try:
+            with open(idx) as f:
+                lines = f.readlines()
+            kept = []
+            for line in lines:
                 try:
-                    await browser.close(kill_chrome=True)
-                except Exception as e:
-                    print(f"[openeyes-web] Failed to close session {sid}: {e}", file=sys.stderr)
-            elif pid:
-                # Session known from persisted state but no BrowserManager in memory
-                # (e.g., server restarted). Kill Chrome directly.
-                import signal
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
+                    if json.loads(line).get("file") not in removed:
+                        kept.append(line)
+                except Exception:
                     pass
-                except Exception as e:
-                    print(f"[openeyes-web] Failed to kill pid {pid} for session {sid}: {e}", file=sys.stderr)
-            _last_active.pop(sid, None)
-            _session_ports.pop(sid, None)
-            data.pop(sid, None)
-            changed = True
-            print(f"[openeyes-web] Reclaimed idle session '{sid}' (idle {int(now - last)}s)", file=sys.stderr)
-
-    if changed:
-        _save_sessions(data)
+            with open(idx, "w") as f:
+                f.writelines(kept)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
-# Model pricing lookup for cost tracking
+# Model pricing lookup for cost tracking — input $/M tokens.
+# Single source of truth: the dashboard reads this via /api/models.
 _MODEL_RATES: dict[str, float] = {
-    "haiku": 0.8, "haiku-4.5": 0.8, "claude-haiku-4-5": 0.8,
-    "sonnet": 3, "sonnet-4.5": 3, "sonnet-4.6": 3, "claude-sonnet-4-5": 3, "claude-sonnet-4-6": 3,
-    "opus": 15, "opus-4": 15, "opus-4.6": 15, "claude-opus-4-6": 15,
+    # Anthropic (current generation)
+    "fable": 10, "fable-5": 10, "claude-fable-5": 10,
+    "opus": 5, "opus-4.8": 5, "opus-4.7": 5, "opus-4.6": 5,
+    "claude-opus-4-8": 5, "claude-opus-4-7": 5, "claude-opus-4-6": 5,
+    "sonnet": 3, "sonnet-5": 3, "sonnet-4.6": 3, "sonnet-4.5": 3,
+    "claude-sonnet-5": 3, "claude-sonnet-4-6": 3, "claude-sonnet-4-5": 3,
+    "haiku": 1, "haiku-4.5": 1, "claude-haiku-4-5": 1,
+    # Non-Anthropic (edit via dashboard if stale)
     "gpt-4o": 2.5, "gpt-4o-mini": 0.15, "gemini-2.5-pro": 1.25,
 }
+
+
+def get_model_rates() -> dict[str, float]:
+    """Model → input $/M tokens (for the dashboard's /api/models endpoint)."""
+    return dict(_MODEL_RATES)
+
+
+# Curated display list for the dashboard's model picker (the raw rates table
+# above contains one entry per alias; this is one row per model).
+_MODEL_DISPLAY: list[dict] = [
+    {"name": "Fable 5", "rate": 10},
+    {"name": "Opus 4.8", "rate": 5},
+    {"name": "Sonnet 5", "rate": 3},
+    {"name": "Haiku 4.5", "rate": 1},
+    {"name": "GPT-4o", "rate": 2.5},
+    {"name": "GPT-4o mini", "rate": 0.15},
+    {"name": "Gemini 2.5 Pro", "rate": 1.25},
+]
+
+
+def get_model_display_list() -> list[dict]:
+    return [dict(m) for m in _MODEL_DISPLAY]
 
 
 @mcp.tool()
 async def set_model(model: str) -> str:
     """Tell OpenEyes Web which AI model is using it, for accurate cost tracking.
     Call this once at the start of your session.
-    Examples: set_model("sonnet-4.5"), set_model("haiku"), set_model("opus")"""
+    Examples: set_model("sonnet-5"), set_model("haiku"), set_model("opus")"""
     global _current_model
     _current_model = model.lower().strip()
     rate = _MODEL_RATES.get(_current_model, None)
@@ -540,15 +686,13 @@ async def click(x: int, y: int, ctx: Context) -> list:
     The screenshot is ~896px wide and ~630px tall, with tick marks at 200px intervals."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
-    vision = _get_vision()
-
-    x = max(0, min(x, vision.actual_width - 1))
-    y = max(0, min(y, vision.actual_height - 1))
+    vision = _get_vision(sid)
 
     vw, vh = browser.viewport_size
-    sx = vw / vision.actual_width
-    sy = vh / vision.actual_height
-    vx, vy = int(x * sx), int(y * sy)
+    aw, ah = vision.display_size(vw, vh)
+    x = max(0, min(x, aw - 1))
+    y = max(0, min(y, ah - 1))
+    vx, vy = int(x * vw / aw), int(y * vh / ah)
 
     result = await browser.click_at_point(vx, vy)
 
@@ -680,7 +824,11 @@ async def switch_tab(index: int, ctx: Context) -> list:
     """Switch to a different tab by index. Use list_tabs() to see available tabs."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
-    await browser.switch_tab(index)
+    error = await browser.switch_tab(index)
+    if error:
+        tabs = browser.list_tabs()
+        tab_info = "\n".join(f"  [{t['index']}] {'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
+        return _track([f"Cannot switch: {error}\n\nOpen tabs:\n{tab_info}"], sid)
     img, crop, context, _ = await _capture(sid)
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Switched to tab {index} | URL: {browser.current_url}")
@@ -705,9 +853,15 @@ async def close_tab(index: int, ctx: Context) -> list:
     Closing the last tab ends the session (Chrome exits, browser state discarded)."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    key = None
+    if 0 <= index < len(browser._pages):
+        key = id(browser._pages[index])
     error = await browser.close_tab(index)
     if error:
         return [f"Cannot close tab {index}: {error}"]
+    if key is not None:
+        _get_vision(sid).forget(key)
+        _get_memory(sid).forget(key)
 
     # Last tab closed — tear down the session entirely.
     if not browser._pages:
@@ -715,12 +869,8 @@ async def close_tab(index: int, ctx: Context) -> list:
             await browser.close()  # Chrome exits on its own once all pages are gone
         except Exception:
             pass
-        _browsers.pop(sid, None)
-        _session_ports.pop(sid, None)
-        _last_active.pop(sid, None)
-        data = _load_sessions()
-        data.pop(sid, None)
-        _save_sessions(data)
+        _drop_session_state(sid)
+        _remove_session_record(sid)
         return [f"Closed tab {index} — last tab, session '{sid}' ended."]
 
     img, crop, context, _ = await _capture(sid)
@@ -732,17 +882,38 @@ async def close_tab(index: int, ctx: Context) -> list:
 
 
 def _start_dashboard():
-    """Start dashboard in background threads (non-blocking)."""
+    """Start dashboard in background threads (non-blocking).
+
+    Safe to call from every transport: if another instance already owns the
+    dashboard port, we silently skip — the session file is shared, so the
+    running dashboard already sees everyone's sessions.
+    """
     import threading
+    import urllib.request
     from .dashboard import _run_http, _ws_proxy, HTTP_PORT, WS_PORT
     import websockets
 
-    http_thread = threading.Thread(target=_run_http, args=(HTTP_PORT,), daemon=True)
+    try:
+        urllib.request.urlopen(f"http://localhost:{HTTP_PORT}/api/sessions", timeout=0.3)
+        return  # Another instance is already serving the dashboard.
+    except Exception:
+        pass
+
+    def _run_http_safe():
+        try:
+            _run_http(HTTP_PORT)
+        except OSError:
+            pass  # Lost the race to another instance — fine.
+
+    http_thread = threading.Thread(target=_run_http_safe, daemon=True)
     http_thread.start()
 
     async def _run_ws():
-        async with websockets.serve(_ws_proxy, '0.0.0.0', WS_PORT, max_size=10_000_000):
-            await asyncio.Future()
+        try:
+            async with websockets.serve(_ws_proxy, '0.0.0.0', WS_PORT, max_size=10_000_000):
+                await asyncio.Future()
+        except OSError:
+            pass
 
     ws_thread = threading.Thread(
         target=lambda: asyncio.new_event_loop().run_until_complete(_run_ws()),
@@ -768,12 +939,15 @@ def main():
         mcp.settings.port = int(os.environ.get("FASTMCP_PORT", SSE_PORT))
         mcp.settings.host = "0.0.0.0"
 
-    # In server mode: start dashboard + browser automatically
+    # Try to bring up the dashboard regardless of transport — _start_dashboard
+    # skips itself if another instance already owns the port.
+    _start_dashboard()
+
+    # In server mode: also warm up the browser
     if transport == "serve":
         transport = "sse"
         mcp.settings.port = int(os.environ.get("FASTMCP_PORT", SSE_PORT))
         mcp.settings.host = "0.0.0.0"
-        _start_dashboard()
         asyncio.get_event_loop().run_until_complete(_warmup_browser())
         print(f"[openeyes-web] MCP server at http://localhost:{mcp.settings.port}/sse", file=sys.stderr)
         print("[openeyes-web] Ready.", file=sys.stderr)

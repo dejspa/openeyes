@@ -6,34 +6,30 @@ from __future__ import annotations
 class PageMemory:
     """Tracks page state changes to give the agent context about what happened.
 
-    Uses URL changes and visual diff ratio (from VisionPipeline) instead of
-    element-based tracking. Simpler and more reliable.
+    One instance per session; URL history is kept per tab (keyed by an opaque
+    tab key) so tab switches don't produce bogus "Page changed" messages.
     """
 
     def __init__(self):
-        self._prev_url: str = ""
-        self._prev_title: str = ""
-        self._step = 0
+        self._prev_url: dict[int, str] = {}  # tab_key -> last seen URL
 
-    def update(self, url: str, title: str, diff_ratio: float = 1.0) -> str:
+    def update(self, tab_key: int, url: str, diff_ratio: float = 1.0) -> str:
         """Record new state and return a context string describing what changed."""
-        self._step += 1
-        changes = []
+        prev = self._prev_url.get(tab_key, "")
+        self._prev_url[tab_key] = url
 
-        if url != self._prev_url:
-            if not self._prev_url:
-                changes.append(f"Loaded: {url}")
-            else:
-                changes.append(f"Page changed: {self._prev_url} -> {url}")
-        elif diff_ratio < 0.3:
-            # Silent — no URL change and diff is small. Don't claim the page
-            # is "unchanged" since we only measured our own diff threshold,
-            # not what the page actually did. Callers decide how to describe it.
-            pass
+        if url != prev:
+            if not prev:
+                return f"Page context: Loaded: {url}"
+            return f"Page context: Page changed: {prev} -> {url}"
+        # No URL change — stay silent. We only measured our own visual diff,
+        # not what the page actually did, so don't claim "unchanged".
+        return ""
 
-        self._prev_url = url
-        self._prev_title = title
+    def forget(self, tab_key: int) -> None:
+        self._prev_url.pop(tab_key, None)
 
-        if not changes:
-            return ""
-        return "Page context: " + ". ".join(changes)
+    def prune(self, live_keys: set[int]) -> None:
+        for key in list(self._prev_url):
+            if key not in live_keys:
+                del self._prev_url[key]
