@@ -34,6 +34,7 @@ TOOLS:
 - get_text() — extract page text (article content, product details, prices)
 - go_back() — browser back
 - screenshot() — fresh screenshot
+- set_device(device) — view the site as "desktop" (default) or "mobile"/"android"/"ipad"
 - new_tab(url) — open a tab for a different site (keeps existing tabs open; reuses the tab if that domain is already open)
 - switch_tab(index) — switch to a tab by index
 - list_tabs() — show all open tabs
@@ -661,6 +662,27 @@ async def set_model(model: str) -> str:
 
 
 @mcp.tool()
+async def set_device(device: str, ctx: Context) -> list:
+    """Switch the emulated device for viewing sites, then reload so the page renders for it.
+    Desktop is the default. Use this to check how a site looks on mobile vs desktop.
+    device: "desktop" | "mobile" (=iphone) | "android" | "ipad" (aliases: phone, pixel, tablet).
+    Changes viewport size, touch, device-pixel-ratio, AND the User-Agent (so sites that
+    serve different HTML to phones render their real mobile version). Applies to every
+    open tab; new tabs inherit it. Example: set_device("mobile") then screenshot()."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    res = await browser.set_device(device)
+    if not res.get("ok"):
+        return _track([res.get("error", "Failed to set device.")], sid)
+    img, crop, context, _ = await _capture(sid)
+    result = [MCPImage(data=img, format="jpeg")]
+    kind = "mobile" if res["mobile"] else "desktop"
+    result.append(f"Device set to '{res['device']}' ({res['w']}×{res['h']}, {kind}) | "
+                  f"URL: {browser.current_url}\n{context}")
+    return _track(result, sid)
+
+
+@mcp.tool()
 async def navigate(url: str, ctx: Context) -> list:
     """Navigate to a URL. If a tab with that domain is already open, switches to it
     instead of navigating away. Use full URLs (with path) to navigate in the current tab.
@@ -673,7 +695,8 @@ async def navigate(url: str, ctx: Context) -> list:
     result = [MCPImage(data=img, format="jpeg")]
     tabs = browser.list_tabs()
     tab_info = " | ".join(f"[{t['index']}{'*' if t['active'] else ''}]{' 📌'+t['pin'] if t['pin'] else ''} {t['url'][:30]}" for t in tabs)
-    text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}\nTabs: {tab_info}"
+    dev = f"\nDevice: {browser.current_device}" if browser.current_device != "desktop" else ""
+    text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}{dev}\nTabs: {tab_info}"
     result.append(text)
     return _track(result, sid)
 
@@ -785,7 +808,8 @@ async def screenshot(ctx: Context) -> list:
     img, _, context, _ = await _capture(sid)
     # Always full screenshot when explicitly requested
     result = [MCPImage(data=img, format="jpeg")]
-    result.append(f"{context}\n\nURL: {browser.current_url}")
+    dev = f" | Device: {browser.current_device}" if browser.current_device != "desktop" else ""
+    result.append(f"{context}\n\nURL: {browser.current_url}{dev}")
     return _track(result, sid)
 
 

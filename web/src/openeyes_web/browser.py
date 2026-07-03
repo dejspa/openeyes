@@ -32,6 +32,42 @@ async def _settle(page: Page, timeout_ms: int = 2000) -> None:
     except Exception:
         pass
 
+_DESKTOP_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/120.0.0.0 Safari/537.36")
+_IPHONE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+_ANDROID_UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/120.0.0.0 Mobile Safari/537.36")
+_IPAD_UA = ("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+
+# Emulated device profiles. Mobile emulation needs viewport + touch + User-Agent +
+# the mobile flag changed together — many sites serve different HTML by UA. Applied
+# at runtime via CDP Emulation.* (what Chrome's device toolbar uses), so it toggles
+# on the existing tab without a new context (cookies/login preserved).
+# dpr is kept at 1: in CDP-attached mode Playwright pins deviceScaleFactor to 1 and
+# wins the override, and DPR only affects raster sharpness / srcset, not layout —
+# which is what "how does this look on mobile" is actually about.
+DEVICE_PROFILES: dict[str, dict] = {
+    "desktop": {"w": 1280, "h": 900, "dpr": 1, "mobile": False, "touch": False, "ua": _DESKTOP_UA},
+    "iphone":  {"w": 390,  "h": 844, "dpr": 1, "mobile": True,  "touch": True,  "ua": _IPHONE_UA},
+    "android": {"w": 412,  "h": 915, "dpr": 1, "mobile": True,  "touch": True,  "ua": _ANDROID_UA},
+    "ipad":    {"w": 820,  "h": 1180, "dpr": 1, "mobile": True, "touch": True,  "ua": _IPAD_UA},
+}
+_DEVICE_ALIASES = {
+    "mobile": "iphone", "phone": "iphone", "ios": "iphone",
+    "pixel": "android", "tablet": "ipad",
+    "pc": "desktop", "computer": "desktop", "laptop": "desktop",
+}
+
+
+def resolve_device(name: str) -> str | None:
+    """Map an agent-supplied device name to a known profile key, or None."""
+    key = (name or "").strip().lower()
+    key = _DEVICE_ALIASES.get(key, key)
+    return key if key in DEVICE_PROFILES else None
+
+
 # Click-time snap: find nearest interactive element at (x, y), piercing shadow DOM.
 # Called with {x, y} in viewport coordinates. Returns element info + click point.
 # On a direct hit the click point is the REQUESTED point (it's already inside the
@@ -240,6 +276,8 @@ class BrowserManager:
         self._active: int = 0
         self._expect_new_page = False
         self._pins: dict[int, str] = {}  # page id -> pin name
+        self._device = "desktop"
+        self._cdp_sessions: dict[int, object] = {}  # id(page) -> persistent CDPSession
         self._vw = viewport_width
         self._vh = viewport_height
         self._cdp_port = cdp_port
@@ -392,10 +430,33 @@ class BrowserManager:
     def _watch_page(self, page: Page) -> None:
         """Keep _pages in sync when a tab is closed externally (dashboard close
         button, window.close(), crash) — otherwise the next screenshot targets
-        a dead page and throws a raw Playwright error at the agent."""
+        a dead page and throws a raw Playwright error at the agent.
+
+        Also re-assert device emulation after any navigation: Playwright re-applies
+        its own viewport (dpr 1, mobile flag off) on navigation, so a click/type that
+        loads a new page would otherwise drop mobile emulation. This makes our
+        override the last write."""
         page.on("close", lambda: self._forget_page(page))
+        page.on("framenavigated", lambda frame, p=page: self._on_frame_nav(p, frame))
+
+    def _on_frame_nav(self, page: Page, frame) -> None:
+        if self._device == "desktop":
+            return
+        try:
+            if frame is not page.main_frame:
+                return
+        except Exception:
+            return
+        asyncio.ensure_future(self._apply_device(page))
+
+    async def _after_nav(self, page: Page) -> None:
+        """Deterministic re-assert after an explicit navigation (the framenavigated
+        hook covers click/type-triggered ones; this awaits it where we control the flow)."""
+        if self._device != "desktop":
+            await self._apply_device(page)
 
     def _forget_page(self, page: Page) -> None:
+        self._cdp_sessions.pop(id(page), None)
         if page not in self._pages:
             return  # already removed by close_tab()
         i = self._pages.index(page)
@@ -432,6 +493,73 @@ class BrowserManager:
     @property
     def viewport_size(self) -> tuple[int, int]:
         return (self._vw, self._vh)
+
+    @property
+    def current_device(self) -> str:
+        return self._device
+
+    # --- Device emulation ---
+
+    async def _cdp_for(self, page: Page):
+        """A persistent CDP session per page. Kept alive (not detached) so the
+        Emulation overrides stick for the lifetime of the tab."""
+        key = id(page)
+        sess = self._cdp_sessions.get(key)
+        if sess is None:
+            sess = await self._context.new_cdp_session(page)
+            self._cdp_sessions[key] = sess
+        return sess
+
+    async def _apply_device(self, page: Page) -> None:
+        """Push the current device profile onto a page via CDP Emulation.*"""
+        prof = DEVICE_PROFILES[self._device]
+        # Keep Playwright's own viewport in sync so screenshot clipping is right.
+        try:
+            await page.set_viewport_size({"width": prof["w"], "height": prof["h"]})
+        except Exception:
+            pass
+        try:
+            cdp = await self._cdp_for(page)
+            await cdp.send("Emulation.setDeviceMetricsOverride", {
+                "width": prof["w"], "height": prof["h"],
+                "deviceScaleFactor": prof["dpr"], "mobile": prof["mobile"],
+                "screenWidth": prof["w"], "screenHeight": prof["h"],
+            })
+            await cdp.send("Emulation.setUserAgentOverride", {"userAgent": prof["ua"]})
+            # maxTouchPoints must be 1-16; omit it when disabling or Chrome rejects
+            # the whole call (leaving touch stuck on when reverting to desktop).
+            touch_params: dict = {"enabled": prof["touch"]}
+            if prof["touch"]:
+                touch_params["maxTouchPoints"] = 5
+            await cdp.send("Emulation.setTouchEmulationEnabled", touch_params)
+        except Exception as e:
+            print(f"[openeyes-web] device emulation failed: {e}", file=sys.stderr)
+
+    async def set_device(self, device: str) -> dict:
+        """Switch the emulated device for every open tab and reload the active tab
+        so UA-gated sites serve the right HTML. Returns {ok, device, w, h, mobile}
+        or {ok: False, error}."""
+        key = resolve_device(device)
+        if key is None:
+            opts = ", ".join(sorted(DEVICE_PROFILES)) + " (aliases: mobile, pixel, tablet)"
+            return {"ok": False, "error": f"Unknown device '{device}'. Options: {opts}"}
+        await self._ensure_browser()
+        self._device = key
+        prof = DEVICE_PROFILES[key]
+        self._vw, self._vh = prof["w"], prof["h"]
+        for page in list(self._pages):
+            await self._apply_device(page)
+        # Reload the active tab so a site that varies by User-Agent (m.* redirects,
+        # server-side device detection) actually re-renders for the new device.
+        if self._pages:
+            active = self._pages[self._active]
+            try:
+                await active.reload(wait_until="domcontentloaded", timeout=20000)
+                await _settle(active)
+                await self._apply_device(active)  # last write wins over Playwright's post-reload viewport
+            except Exception:
+                pass
+        return {"ok": True, "device": key, "w": prof["w"], "h": prof["h"], "mobile": prof["mobile"]}
 
     @property
     def active_tab_key(self) -> int:
@@ -484,6 +612,7 @@ class BrowserManager:
                         self._active = i
                         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                         await _settle(page)
+                        await self._after_nav(page)
                         await _human_delay(300, 700)
                         return self._active
 
@@ -496,9 +625,14 @@ class BrowserManager:
         self._watch_page(page)
         if pin:
             self._pins[id(page)] = pin
+        # New tabs inherit the current device — apply the UA before navigating so
+        # a UA-gated site serves the right HTML on first load.
+        if self._device != "desktop":
+            await self._apply_device(page)
         if url and url != "about:blank":
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _settle(page)
+            await self._after_nav(page)
             await _human_delay(300, 700)
         return self._active
 
@@ -566,6 +700,7 @@ class BrowserManager:
         page = self._pages[self._active]
         await page.goto(url, wait_until=wait_until, timeout=30000)
         await _settle(page)
+        await self._after_nav(page)
         await _human_delay(300, 700)
         return "Navigated"
 
@@ -625,6 +760,7 @@ class BrowserManager:
         page = await self._ensure_browser()
         await page.go_back(timeout=10000)
         await _settle(page)
+        await self._after_nav(page)
         await _human_delay(200, 500)
 
     async def get_page_title(self) -> str:
@@ -651,6 +787,7 @@ class BrowserManager:
         self._pages = []
         self._active = 0
         self._pins = {}
+        self._cdp_sessions = {}
         self._context = None
         self._browser = None
         self._pw = None

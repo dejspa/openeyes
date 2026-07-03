@@ -174,7 +174,7 @@ Each agent gets a completely isolated Chrome instance. Tabs and login sessions p
 
 See [SKILL.md](SKILL.md) for integration with Codex CLI, Gemini CLI, and other agent harnesses.
 
-Works with any MCP-compatible agent. The 12 tools appear automatically after connecting.
+Works with any MCP-compatible agent. The 13 tools appear automatically after connecting.
 
 ## Environment variables
 
@@ -196,11 +196,18 @@ Works with any MCP-compatible agent. The 12 tools appear automatically after con
 | `get_text()` | Extract page text (articles, prices, product details) |
 | `go_back()` | Browser back |
 | `screenshot()` | Fresh screenshot |
+| `set_device(device)` | View the site as `"desktop"` (default) or `"mobile"`/`"android"`/`"ipad"` — switches viewport, touch, and User-Agent, then reloads |
 | `set_model(model)` | Set model name for cost tracking |
 | `new_tab(url, pin)` | Open a new tab, optionally pin it |
 | `switch_tab(index)` | Switch to a tab by index |
 | `list_tabs()` | Show all open tabs |
 | `close_tab(index)` | Close a tab |
+
+## Device emulation (desktop / mobile)
+
+Desktop by default. The agent can call `set_device("mobile")` (or `"android"`, `"ipad"`) to see how a site renders on a phone, and `set_device("desktop")` to switch back. It changes the viewport size, touch support, the mobile flag, **and** the User-Agent together — then reloads — so sites that serve different HTML to phones show their real mobile version, not just a narrowed desktop layout. The setting applies to every open tab and new tabs inherit it.
+
+Implemented via Chrome DevTools Protocol `Emulation.*` (what Chrome's own device toolbar uses), so it toggles on the existing tab without a new browser context — cookies and logins are preserved. Device-pixel-ratio stays at 1 (Playwright pins it in CDP-attached mode); it only affects raster sharpness, not layout.
 
 ## Smart token optimization
 
@@ -210,6 +217,22 @@ Not every action needs a screenshot:
 - **`click` with no page change** → text-only feedback: "Clicked: \<button> 'Add to cart'"
 - **Minor change (modal opened)** → only the changed region is sent, not the full page
 - **`scroll` at bottom of page** → text-only: "No new content visible"
+
+## Token benchmark (measured)
+
+Perception tokens — what each tool feeds back into the model's context per action — over the same live pages and the same action sequence: `navigate` + 2× `scroll`. OpenEyes also pays for one explicit `get_text`; a DOM/accessibility-tree tool (measured here with Playwright's a11y snapshot) returns the page's full tree on **every** action, with the text already inside it.
+
+| Page | OpenEyes Web | Playwright a11y tree | |
+|---|--:|--:|---|
+| example.com (trivial) | 782 | **159** | a11y 4.9× cheaper |
+| Hacker News front page | **3,813** | 30,438 | OpenEyes 8.0× cheaper |
+| Wikipedia article | **4,607** | 53,505 | OpenEyes 11.6× cheaper |
+| Wikipedia Main Page (heavy) | **4,162** | 32,139 | OpenEyes 7.7× cheaper |
+| **Total** | **13,364** | **116,241** | **OpenEyes 8.7× cheaper** |
+
+A screenshot is a fixed ~750 tokens no matter how complex the page, and diff-gating drops unchanged frames to zero — whereas an accessibility/DOM snapshot scales with the DOM and is re-sent every action. On content-rich pages OpenEyes runs **8–12× leaner**; the gap only reverses on near-empty pages, where a fixed-size screenshot is overkill and the tiny a11y tree wins. For scale: one a11y snapshot of the Wikipedia article (~17,800 tokens) costs as much as OpenEyes scrolling through **~23 full screens**.
+
+**Method & caveats.** Image tokens use Anthropic's documented `ceil(w×h/750)` on the actual sent JPEG; text uses `tiktoken` (cl100k_base), which undercounts markup and therefore *understates* the tree side — the real gap is likely wider. These are perception tokens only: they exclude the agent's own reasoning, and they don't credit the a11y tree's exact element refs, which can reduce misclick retries. OpenEyes narrows that accuracy gap with click-time snap-to-element.
 
 ## License
 
