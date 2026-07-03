@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import functools
 import json
 import os
 import sys
@@ -46,13 +47,15 @@ HOW CLICKING WORKS:
 - Subtle tick marks along the top and left edges at 200px intervals help you gauge position.
 - Your click is automatically snapped to the nearest interactive element (button, link, input).
 - After each click you'll see feedback like "Clicked: <button> 'Add to cart'" confirming what was hit.
+- If your click misses (no interactive element there), the response lists the nearest clickable elements with their coordinates — use those to retry precisely instead of guessing again.
 - To type into a field: click its coordinates first (to focus it), then use type_text().
 - To search: click the search field, then type_text(query, press_enter=true, clear_first=true).
 - Some actions return text-only feedback (no screenshot) when the page didn't visually change. Use screenshot() if you need to see the current state.
 
 IMPORTANT BEHAVIORS:
 - If a cookie banner, ad interstitial, or overlay blocks the page, click its accept/dismiss/close button.
-- Popup tabs (ads, new windows) are auto-closed.
+- When a site opens content in a new tab (e.g. a report or checkout via target=_blank), it's adopted and becomes the active tab; blank ad-popups are auto-closed. Use list_tabs() to see what's open.
+- If navigate() reports a page "did not fully load", the site was slow or unreachable — the screenshot shows whatever rendered; retry or try a different URL.
 
 STRATEGY GUIDE — follow these patterns for best results:
 
@@ -110,6 +113,7 @@ _page_tokens: dict[int, int] = {}  # id(page) -> cumulative tokens
 _current_model: str = os.environ.get("OPENEYES_WEB_MODEL", "unknown")
 _session_ports: dict[str, int] = {}  # session_id -> CDP port
 _last_active: dict[str, float] = {}  # session_id -> unix timestamp
+_locks: dict[str, asyncio.Lock] = {}  # session_id -> serialize tool calls
 _cleanup_started = False
 
 _TOKEN_LOG = os.path.expanduser("~/.openeyes/web/token-log.jsonl")
@@ -148,6 +152,25 @@ def _session_id(ctx: Context | None) -> str:
                     if name:
                         return name
     return "default"
+
+
+def _lock_for(sid: str) -> asyncio.Lock:
+    lock = _locks.get(sid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[sid] = lock
+    return lock
+
+
+def _guard(fn):
+    """Serialize a tool's calls per session so overlapping requests (e.g. two SSE
+    calls to the same session) can't interleave awaits on the one shared page."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        ctx = kwargs.get("ctx") or next((a for a in args if isinstance(a, Context)), None)
+        async with _lock_for(_session_id(ctx)):
+            return await fn(*args, **kwargs)
+    return wrapper
 
 
 # --- Session file: shared across processes, so guard read-modify-write with flock ---
@@ -662,6 +685,7 @@ async def set_model(model: str) -> str:
 
 
 @mcp.tool()
+@_guard
 async def set_device(device: str, ctx: Context) -> list:
     """Switch the emulated device for viewing sites, then reload so the page renders for it.
     Desktop is the default. Use this to check how a site looks on mobile vs desktop.
@@ -683,6 +707,7 @@ async def set_device(device: str, ctx: Context) -> list:
 
 
 @mcp.tool()
+@_guard
 async def navigate(url: str, ctx: Context) -> list:
     """Navigate to a URL. If a tab with that domain is already open, switches to it
     instead of navigating away. Use full URLs (with path) to navigate in the current tab.
@@ -702,6 +727,7 @@ async def navigate(url: str, ctx: Context) -> list:
 
 
 @mcp.tool()
+@_guard
 async def click(x: int, y: int, ctx: Context) -> list:
     """Click at (x, y) coordinates on the screenshot.
     Look at the screenshot and estimate the pixel position of the element you want to click.
@@ -729,6 +755,17 @@ async def click(x: int, y: int, ctx: Context) -> list:
             desc += f" (snapped {result.get('radius', '?')}px)"
     else:
         desc = f"No interactive element at ({x}, {y}) — raw click performed"
+        nearby = result.get("nearby") or []
+        if nearby:
+            # Hand back the nearest clickables in DISPLAY coords so the agent can
+            # retry precisely instead of guessing again.
+            sx, sy = aw / vw, ah / vh
+            items = "; ".join(
+                f"<{n['tag']}>" + (f" '{n['text']}'" if n.get('text') else "")
+                + f" at ({int(n['cx'] * sx)}, {int(n['cy'] * sy)})"
+                for n in nearby
+            )
+            desc += f"\nNearest clickable elements: {items}"
 
     img, crop, context, diff_ratio = await _capture(sid)
     return _track(_build_response(img, crop, context,
@@ -737,6 +774,7 @@ async def click(x: int, y: int, ctx: Context) -> list:
 
 
 @mcp.tool()
+@_guard
 async def type_text(text: str, ctx: Context, press_enter: bool = False, clear_first: bool = False) -> list:
     """Type text into the currently focused element.
     Set clear_first=true to select-all and replace existing text.
@@ -757,6 +795,7 @@ async def type_text(text: str, ctx: Context, press_enter: bool = False, clear_fi
 
 
 @mcp.tool()
+@_guard
 async def scroll(ctx: Context, direction: str = "down") -> list:
     """Scroll the page. Direction: 'up' or 'down'."""
     sid = _session_id(ctx)
@@ -775,6 +814,7 @@ async def scroll(ctx: Context, direction: str = "down") -> list:
 
 
 @mcp.tool()
+@_guard
 async def get_text(ctx: Context) -> str:
     """Extract the main text content of the current page (article body, headings, paragraphs).
     Use this to read articles, blog posts, or any page with text content.
@@ -788,6 +828,7 @@ async def get_text(ctx: Context) -> str:
 
 
 @mcp.tool()
+@_guard
 async def go_back(ctx: Context) -> list:
     """Go back to the previous page."""
     sid = _session_id(ctx)
@@ -801,6 +842,7 @@ async def go_back(ctx: Context) -> list:
 
 
 @mcp.tool()
+@_guard
 async def screenshot(ctx: Context) -> list:
     """Take a fresh screenshot of the current page."""
     sid = _session_id(ctx)
@@ -814,6 +856,7 @@ async def screenshot(ctx: Context) -> list:
 
 
 @mcp.tool()
+@_guard
 async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "", force_new: bool = False) -> list:
     """Open a new browser tab.
 
@@ -844,6 +887,7 @@ async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "", force_n
 
 
 @mcp.tool()
+@_guard
 async def switch_tab(index: int, ctx: Context) -> list:
     """Switch to a different tab by index. Use list_tabs() to see available tabs."""
     sid = _session_id(ctx)
@@ -860,6 +904,7 @@ async def switch_tab(index: int, ctx: Context) -> list:
 
 
 @mcp.tool()
+@_guard
 async def list_tabs(ctx: Context) -> str:
     """List all open browser tabs."""
     sid = _session_id(ctx)
@@ -872,6 +917,7 @@ async def list_tabs(ctx: Context) -> str:
 
 
 @mcp.tool()
+@_guard
 async def close_tab(index: int, ctx: Context) -> list:
     """Close a tab by index. Pinned tabs cannot be closed.
     Closing the last tab ends the session (Chrome exits, browser state discarded)."""

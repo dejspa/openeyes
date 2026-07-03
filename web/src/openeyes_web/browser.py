@@ -3,24 +3,50 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-# OPENEYES_WEB_FAST=1 removes the human-mimicking delays (pure latency win on
-# sites that don't fingerprint timing).
+# OPENEYES_WEB_FAST=1 forces the human-mimicking delays off everywhere. By default
+# we skip them only on localhost / IP-literal hosts (assumed dev servers we own) and
+# keep them for real websites, where instant robotic timing is a bot tell.
 _FAST = os.environ.get("OPENEYES_WEB_FAST", "") == "1"
 
 
-async def _human_delay(min_ms: int = 100, max_ms: int = 400) -> None:
-    """Random delay to mimic a fast human — not instant, not slow."""
-    if _FAST:
-        return
-    await asyncio.sleep(random.randint(min_ms, max_ms) / 1000)
+def _is_dev_host(url: str) -> bool:
+    """True for localhost and IP-literal hosts — treated as local dev, safe to be fast."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _nav_error(e: Exception) -> str:
+    """Condense a verbose Playwright navigation error to something actionable."""
+    msg = str(e).split("\n", 1)[0]
+    m = re.search(r"net::[A-Z_]+", msg)
+    if m:
+        return m.group(0)
+    low = msg.lower()
+    if "timeout" in low or "exceeded" in low:
+        return "timed out"
+    return msg[:120]
 
 
 async def _settle(page: Page, timeout_ms: int = 2000) -> None:
@@ -179,6 +205,36 @@ _CLICK_SNAP_JS = """
         return [rect.x + rect.width / 2, rect.y + rect.height / 2];
     }
 
+    // Collect the interactive elements nearest to (x, y) so a missed click can be
+    // corrected in one step instead of blind re-guessing. Viewport-px centers.
+    function collectNearby(px, py, max) {
+        const sel = 'a,button,input,select,textarea,summary,[role],[onclick],[contenteditable="true"],[tabindex]';
+        const seen = new Set();
+        const out = [];
+        for (const el of document.querySelectorAll(sel)) {
+            if (SVG_SUBTREE_TAGS.has(el.tagName)) continue;
+            const ti = el.getAttribute('tabindex');
+            const role = el.getAttribute('role');
+            const semantic = INTERACTIVE_TAGS.has(el.tagName) || (role && INTERACTIVE_ROLES.has(role))
+                || el.getAttribute('onclick') || el.getAttribute('contenteditable') === 'true'
+                || (ti && ti !== '-1');
+            if (!semantic) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) continue;
+            if (r.bottom < 0 || r.top > window.innerHeight || r.right < 0 || r.left > window.innerWidth) continue;
+            const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
+            const k = el.tagName + cx + ',' + cy;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            let label = (el.textContent || el.getAttribute('aria-label')
+                || el.getAttribute('placeholder') || el.value || '').trim().slice(0, 40);
+            out.push({tag: el.tagName.toLowerCase(), text: label, cx, cy,
+                      d: Math.round(Math.hypot(cx - px, cy - py))});
+        }
+        out.sort((a, b) => a.d - b.d);
+        return out.slice(0, max);
+    }
+
     // 1. Direct hit — click exactly where asked; the point is inside the element.
     const hit = deepElementFromPoint(x, y);
     if (hit) {
@@ -203,12 +259,14 @@ _CLICK_SNAP_JS = """
         }
     }
 
-    // 3. No interactive element — raw click
+    // 3. No interactive element — raw click, but hand back the nearest clickables
+    //    (viewport-px centers) so the agent can retry precisely.
     return {
         found: false, method: 'raw',
         tag: hit ? hit.tagName.toLowerCase() : 'unknown',
         type: '', text: hit ? (hit.textContent || '').trim().slice(0, 60) : '',
         cx: x, cy: y,
+        nearby: collectNearby(x, y, 6),
     };
 }
 """
@@ -438,6 +496,18 @@ class BrowserManager:
         override the last write."""
         page.on("close", lambda: self._forget_page(page))
         page.on("framenavigated", lambda frame, p=page: self._on_frame_nav(p, frame))
+        page.on("dialog", lambda d: asyncio.ensure_future(self._handle_dialog(d)))
+
+    async def _handle_dialog(self, dialog) -> None:
+        """Keep JS dialogs from blocking the page. Accept beforeunload (so navigation
+        can proceed), dismiss alert/confirm/prompt (so the page doesn't wedge)."""
+        try:
+            if dialog.type == "beforeunload":
+                await dialog.accept()
+            else:
+                await dialog.dismiss()
+        except Exception:
+            pass
 
     def _on_frame_nav(self, page: Page, frame) -> None:
         if self._device == "desktop":
@@ -455,6 +525,22 @@ class BrowserManager:
         if self._device != "desktop":
             await self._apply_device(page)
 
+    async def _safe_goto(self, page: Page, url: str, wait_until: str = "domcontentloaded") -> str | None:
+        """Navigate without raising. Returns None on success or a short error string.
+        Settle + device re-assert run regardless, so a partially-loaded page is still
+        usable and the caller can screenshot whatever rendered."""
+        err = None
+        try:
+            await page.goto(url, wait_until=wait_until, timeout=30000)
+        except Exception as e:
+            err = _nav_error(e)
+        try:
+            await _settle(page)
+            await self._after_nav(page)
+        except Exception:
+            pass
+        return err
+
     def _forget_page(self, page: Page) -> None:
         self._cdp_sessions.pop(id(page), None)
         if page not in self._pages:
@@ -468,27 +554,52 @@ class BrowserManager:
             self._active = max(0, len(self._pages) - 1)
 
     def _on_new_page(self, page) -> None:
-        """Auto-close popup tabs unless opened intentionally via new_tab()."""
+        """Handle a tab the site opened itself (target=_blank, window.open).
+
+        Old behaviour closed all of these, which broke flows that open the real
+        destination — a report, checkout, or OAuth window — in a new tab. Instead
+        we adopt it and make it active so the agent sees it, then reap it only if
+        it never loads real content (a blank ad shell that never navigated)."""
         if self._expect_new_page:
-            return  # Intentional — will be managed by new_tab()
-        async def _close():
+            return  # Intentional — new_tab() manages it
+        self._pages.append(page)
+        self._active = len(self._pages) - 1
+        self._watch_page(page)
+
+        async def _settle_or_reap():
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=3000)
             except Exception:
                 pass
+            if self._device != "desktop":
+                try:
+                    await self._apply_device(page)
+                except Exception:
+                    pass
             url = page.url
-            print(f"[openeyes-web] Auto-closing popup tab: {url[:80]}", file=sys.stderr)
-            try:
-                await page.close()
-            except Exception:
-                pass
-        asyncio.ensure_future(_close())
+            if not url or url == "about:blank":
+                # Never navigated to real content — treat as a junk popup and reap it.
+                print("[openeyes-web] Reaping blank popup tab", file=sys.stderr)
+                self._forget_page(page)
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            else:
+                print(f"[openeyes-web] Adopted new tab: {url[:80]}", file=sys.stderr)
+        asyncio.ensure_future(_settle_or_reap())
 
     @property
     def current_url(self) -> str:
         if not self._pages:
             return "about:blank"
         return self._pages[self._active].url
+
+    async def _delay(self, min_ms: int, max_ms: int) -> None:
+        """Human-like jitter — skipped on dev hosts (localhost/IP) or with FAST=1."""
+        if _FAST or _is_dev_host(self.current_url):
+            return
+        await asyncio.sleep(random.randint(min_ms, max_ms) / 1000)
 
     @property
     def viewport_size(self) -> tuple[int, int]:
@@ -610,10 +721,8 @@ class BrowserManager:
                         continue
                     if existing == domain:
                         self._active = i
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        await _settle(page)
-                        await self._after_nav(page)
-                        await _human_delay(300, 700)
+                        await self._safe_goto(page, url)
+                        await self._delay(300, 700)
                         return self._active
 
         self._expect_new_page = True
@@ -630,10 +739,8 @@ class BrowserManager:
         if self._device != "desktop":
             await self._apply_device(page)
         if url and url != "about:blank":
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await _settle(page)
-            await self._after_nav(page)
-            await _human_delay(300, 700)
+            await self._safe_goto(page, url)
+            await self._delay(300, 700)
         return self._active
 
     async def switch_tab(self, index: int) -> str | None:
@@ -693,26 +800,36 @@ class BrowserManager:
                 await self._pages[existing].bring_to_front()
                 return f"Switched to existing tab {existing}"
 
-        # Ensure url has protocol
-        if not url.startswith("http"):
+        # Preserve any explicit scheme (http, https, file, about, …); only a bare
+        # host/keyword gets upgraded to https (with an http retry on failure).
+        upgraded = False
+        if "://" not in url and not url.startswith("about:"):
             url = f"https://{url}"
+            upgraded = True
 
         page = self._pages[self._active]
-        await page.goto(url, wait_until=wait_until, timeout=30000)
-        await _settle(page)
-        await self._after_nav(page)
-        await _human_delay(300, 700)
+        err = await self._safe_goto(page, url, wait_until)
+        if err and upgraded and url.startswith("https://"):
+            # The https upgrade may be wrong for an http-only host — retry http once.
+            err = await self._safe_goto(page, "http://" + url[len("https://"):], wait_until)
+        await self._delay(300, 700)
+        if err:
+            return f"Navigation to {url} did not fully load ({err}) — showing current state."
         return "Navigated"
 
     async def screenshot_bytes(self) -> bytes:
-        """Capture viewport-only screenshot as PNG bytes."""
+        """Capture viewport-only screenshot as JPEG bytes.
+
+        JPEG (not PNG) is smaller and faster to encode/decode; the pipeline
+        downscales and re-encodes anyway, and q90 artifacts stay well under the
+        diff's 30/255 change threshold so they don't inflate diff ratios."""
         page = await self._ensure_browser()
         try:
-            return await page.screenshot(type="png", full_page=False, timeout=10000)
+            return await page.screenshot(type="jpeg", quality=90, full_page=False, timeout=10000)
         except Exception:
             # Fallback: skip animations/fonts that may hang
             return await page.screenshot(
-                type="png", full_page=False, timeout=10000,
+                type="jpeg", quality=90, full_page=False, timeout=10000,
                 animations="disabled",
             )
 
@@ -734,7 +851,7 @@ class BrowserManager:
         page = await self._ensure_browser()
         result = await page.evaluate(_CLICK_SNAP_JS, {"x": x, "y": y})
         await page.mouse.click(result["cx"], result["cy"])
-        await _human_delay(150, 400)
+        await self._delay(150, 400)
         return result
 
     async def type_text(self, text: str, press_enter: bool = False,
@@ -742,26 +859,29 @@ class BrowserManager:
         page = await self._ensure_browser()
         if clear_first:
             await page.keyboard.press("Control+a")
-            await _human_delay(50, 150)
+            await self._delay(50, 150)
         await page.keyboard.type(text, delay=0 if _FAST else random.randint(20, 50))
         if press_enter:
-            await _human_delay(100, 300)
+            await self._delay(100, 300)
             await page.keyboard.press("Enter")
             await _settle(page, timeout_ms=1500)
-            await _human_delay(300, 600)
+            await self._delay(300, 600)
 
     async def scroll(self, direction: str = "down", amount: int = 3) -> None:
         page = await self._ensure_browser()
         delta = amount * 300 * (1 if direction == "down" else -1)
         await page.mouse.wheel(0, delta)
-        await _human_delay(200, 500)
+        await self._delay(200, 500)
 
     async def back(self) -> None:
         page = await self._ensure_browser()
-        await page.go_back(timeout=10000)
+        try:
+            await page.go_back(timeout=10000)
+        except Exception:
+            pass  # no history / blocked — leave the page as-is, caller screenshots it
         await _settle(page)
         await self._after_nav(page)
-        await _human_delay(200, 500)
+        await self._delay(200, 500)
 
     async def get_page_title(self) -> str:
         page = await self._ensure_browser()
