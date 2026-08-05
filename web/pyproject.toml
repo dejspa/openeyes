@@ -5,7 +5,7 @@ description = "OpenEyes Web — vision-first web browser for AI agents. See what
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "playwright>=1.40.0",
+    "playwright>=1.62.0",
     "Pillow>=10.0.0",
     "websockets>=12.0",
 ]

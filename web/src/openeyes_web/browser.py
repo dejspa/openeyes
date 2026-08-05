@@ -20,6 +20,11 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 _FAST = os.environ.get("OPENEYES_WEB_FAST", "") == "1"
 
 
+def _harden_chrome_command(command: list[str]) -> list[str]:
+    """Use Playwright's standard crash-reporting policy for managed Chromium."""
+    return [command[0], "--disable-breakpad", *command[1:]]
+
+
 def _is_dev_host(url: str) -> bool:
     """True for localhost and IP-literal hosts — treated as local dev, safe to be fast."""
     try:
@@ -323,6 +328,8 @@ class BrowserManager:
                                 connect from any browser to see/interact live
         SLOW_MO=300           — delay (ms) between Playwright actions
         OPENEYES_WEB_FAST=1   — skip human-mimicking delays
+        OPENEYES_WEB_MAX_TABS — maximum tabs kept per session (default 20,
+                                0 disables; pinned tabs may exceed the limit)
     """
 
     def __init__(self, viewport_width: int = 1280, viewport_height: int = 900,
@@ -341,11 +348,42 @@ class BrowserManager:
         self._cdp_port = cdp_port
         self._headed = headed
         self._slow_mo = slow_mo
+        try:
+            self._max_tabs = max(0, int(os.environ.get("OPENEYES_WEB_MAX_TABS", "20")))
+        except ValueError:
+            self._max_tabs = 20
+            print("[openeyes-web] Invalid OPENEYES_WEB_MAX_TABS; using 20", file=sys.stderr)
+        self._ensure_lock = asyncio.Lock()
         self._chrome_pid: int | None = None  # PID of Chrome we launched (None if we reused an existing one)
 
     async def _ensure_browser(self) -> Page:
+        async with self._ensure_lock:
+            return await self._ensure_browser_locked()
+
+    async def _ensure_browser_locked(self) -> Page:
         if self._pages:
             return self._pages[self._active]
+
+        # A browser with no pages is still initialized. Reuse its context instead
+        # of starting another Playwright driver and orphaning the old one.
+        if self._browser and self._browser.is_connected() and self._context:
+            self._expect_new_page = True
+            try:
+                page = await self._context.new_page()
+            finally:
+                self._expect_new_page = False
+            await page.set_viewport_size({"width": self._vw, "height": self._vh})
+            self._pages = [page]
+            self._active = 0
+            self._watch_page(page)
+            return page
+
+        # Do not overwrite a stale Playwright driver after a browser disconnect.
+        if self._pw:
+            await self._pw.stop()
+            self._pw = None
+        self._browser = None
+        self._context = None
 
         headed = self._headed
         slow_mo = self._slow_mo
@@ -389,9 +427,6 @@ class BrowserManager:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-renderer-backgrounding",
                     f"--window-size={self._vw},{self._vh}",
                     "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 ]
@@ -424,7 +459,7 @@ class BrowserManager:
                 # Chrome survives this process, but we track the PID so TTL
                 # cleanup can terminate it when the session expires.
                 proc = subprocess.Popen(
-                    chrome_args,
+                    _harden_chrome_command(chrome_args),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     env=env,
@@ -465,6 +500,7 @@ class BrowserManager:
                 self._watch_page(page)
 
             self._context.on("page", self._on_new_page)
+            await self._enforce_tab_limit()
 
             print(f"[openeyes-web] Live browser at http://localhost:{port} ({len(self._pages)} tab(s))", file=sys.stderr)
         else:
@@ -553,6 +589,23 @@ class BrowserManager:
         if self._active >= len(self._pages):
             self._active = max(0, len(self._pages) - 1)
 
+    async def _enforce_tab_limit(self, protected=None) -> None:
+        """Close the oldest unpinned background tabs until the session is bounded."""
+        if not self._max_tabs:
+            return
+        while len(self._pages) > self._max_tabs:
+            victim = next((p for i, p in enumerate(self._pages)
+                           if p is not protected and i != self._active
+                           and id(p) not in self._pins), None)
+            if victim is None:
+                return  # Pinned/active tabs are never evicted.
+            try:
+                await victim.close()
+            except Exception as e:
+                print(f"[openeyes-web] Failed to evict tab {victim.url[:80]}: {e}", file=sys.stderr)
+                return
+            self._forget_page(victim)  # close event normally did this already
+
     def _on_new_page(self, page) -> None:
         """Handle a tab the site opened itself (target=_blank, window.open).
 
@@ -567,6 +620,9 @@ class BrowserManager:
         self._watch_page(page)
 
         async def _settle_or_reap():
+            # Reclaim an old tab before waiting for this popup to load so a popup
+            # burst cannot create unbounded renderers during the settle timeout.
+            await self._enforce_tab_limit(protected=page)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=3000)
             except Exception:
@@ -587,6 +643,7 @@ class BrowserManager:
                     pass
             else:
                 print(f"[openeyes-web] Adopted new tab: {url[:80]}", file=sys.stderr)
+                await self._enforce_tab_limit(protected=page)
         asyncio.ensure_future(_settle_or_reap())
 
     @property
@@ -741,6 +798,7 @@ class BrowserManager:
         if url and url != "about:blank":
             await self._safe_goto(page, url)
             await self._delay(300, 700)
+        await self._enforce_tab_limit(protected=page)
         return self._active
 
     async def switch_tab(self, index: int) -> str | None:
