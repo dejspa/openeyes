@@ -427,6 +427,16 @@ class BrowserManager:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    # Without this Chrome asks gnome-keyring over D-Bus at
+                    # startup, and on WSL2 that call never returns — the
+                    # browser half-starts: CDP answers /json and small
+                    # commands, but no page ever renders a frame, so every
+                    # screenshot is blank or times out and a second
+                    # connect_over_cdp client hangs mid-init. Playwright's own
+                    # launcher always passes it, which is why playwright-
+                    # launched Chrome worked while ours froze (found by
+                    # flag-bisection 2026-08-11).
+                    "--password-store=basic",
                     f"--window-size={self._vw},{self._vh}",
                     "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 ]
