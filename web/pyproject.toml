@@ -14,6 +14,7 @@ dependencies = [
 openeyes-web = "openeyes_web.server:main"
 openeyes-web-serve = "openeyes_web.server:serve"
 openeyes-web-dashboard = "openeyes_web.dashboard:main"
+openeyes-web-cleanup = "openeyes_web.server:cleanup"
 
 [build-system]
 requires = ["hatchling"]

@@ -13,7 +13,12 @@ import functools
 import hashlib
 import json
 import os
+import select
+import signal
+import socket
+import stat
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 
@@ -105,6 +110,7 @@ _BASE_CDP_PORT = int(os.environ.get("OPENEYES_WEB_CDP_PORT", "9222"))
 _TTL_SECONDS = 48 * 3600
 _CLEANUP_INTERVAL = 1800  # 30 min
 _HISTORY_RETENTION_DAYS = 14
+_PROCESS_EXIT_TIMEOUT = 5.0
 _SESSION_FILE = "/tmp/openeyes-web-sessions.json"
 
 _browsers: dict[str, BrowserManager] = {}
@@ -224,34 +230,57 @@ def _guard(fn):
 
 # --- Session file: shared across processes, so guard read-modify-write with flock ---
 
+def _open_owned_regular(path: str, flags: int, mode: int = 0o600) -> int:
+    """Open a private state file without following a predictable /tmp symlink."""
+    fd = os.open(path, flags | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        os.close(fd)
+        raise PermissionError(f"unsafe OpenEyes state file: {path}")
+    os.fchmod(fd, mode)
+    return fd
+
+
 @contextmanager
 def _session_lock():
-    lf = open(_SESSION_FILE + ".lock", "w")
+    fd = _open_owned_regular(_SESSION_FILE + ".lock", os.O_RDWR | os.O_CREAT)
     try:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        fcntl.flock(lf, fcntl.LOCK_UN)
-        lf.close()
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _load_sessions() -> dict[str, dict]:
     try:
-        with open(_SESSION_FILE) as f:
-            return json.load(f)
-    except Exception:
+        fd = _open_owned_regular(_SESSION_FILE, os.O_RDONLY)
+    except FileNotFoundError:
         return {}
+    with os.fdopen(fd) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("OpenEyes session registry must contain a JSON object")
+    return data
 
 
 def _save_sessions(data: dict[str, dict]) -> None:
-    """Atomic write — readers in other processes never see a partial file."""
+    """Atomically write private state without a predictable temporary path."""
+    tmp = None
     try:
-        tmp = _SESSION_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        directory = os.path.dirname(_SESSION_FILE) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".openeyes-sessions-", dir=directory)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f)
         os.replace(tmp, _SESSION_FILE)
     except Exception:
-        pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def _update_session_record(session_id: str, port: int, chrome_pid: int | None = None) -> None:
@@ -273,6 +302,20 @@ def _remove_session_record(session_id: str) -> None:
             _save_sessions(data)
 
 
+def _port_listening(port: int) -> bool:
+    """Return whether Chrome's wildcard bind would conflict on this port."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("0.0.0.0", port))
+        return False
+    except OSError:
+        # Fail closed: an existing listener or another bind restriction both
+        # mean this port is unsafe to allocate or declare process-free.
+        return True
+    finally:
+        probe.close()
+
+
 def _allocate_port(session_id: str) -> int:
     """Return a CDP port for this session, allocating a fresh one if needed.
 
@@ -283,17 +326,20 @@ def _allocate_port(session_id: str) -> int:
     with _session_lock():
         persisted = _load_sessions()
         if session_id in persisted:
+            # Refresh the lease while still holding the allocation lock. A
+            # detached Chrome may be reconnecting with a new PID; cleanup must
+            # not reclaim it between allocation and the first browser call.
+            persisted[session_id]["last_active"] = time.time()
+            _save_sessions(persisted)
             port = persisted[session_id]["port"]
             _session_ports[session_id] = port
             return port
         used = set(_session_ports.values()) | {r["port"] for r in persisted.values()}
-        # "default" always gets the base port (back-compat with single-session deployments)
-        if session_id == "default" and _BASE_CDP_PORT not in used:
-            port = _BASE_CDP_PORT
-        else:
-            port = _BASE_CDP_PORT
-            while port in used:
-                port += 1
+        # Prefer the legacy base port for "default", but never reserve a port
+        # already owned by an unregistered listener.
+        port = _BASE_CDP_PORT
+        while port in used or _port_listening(port):
+            port += 1
         persisted[session_id] = {"port": port, "last_active": time.time()}
         _save_sessions(persisted)
     _session_ports[session_id] = port
@@ -456,7 +502,9 @@ async def _get_browser(session_id: str) -> BrowserManager:
             # Also reap the persisted record — port stays the same on recreate.
             _remove_session_record(session_id)
         else:
-            _bg(lambda: _update_session_record(session_id, port))
+            # Persist the heartbeat before handing out the existing browser so
+            # a cleanup process cannot act on stale activity after this returns.
+            _update_session_record(session_id, port)
             if not _cleanup_started:
                 asyncio.create_task(_cleanup_loop())
                 _cleanup_started = True
@@ -608,35 +656,177 @@ async def _cleanup_loop() -> None:
             print(f"[openeyes-web] Cleanup error: {e}", file=sys.stderr)
 
 
-async def _cleanup_expired() -> None:
-    """Close any session whose last_active is older than TTL. Chrome killed, logs kept."""
-    now = time.time()
-    data = _load_sessions()
-    expired = [sid for sid, rec in data.items()
-               if rec.get("last_active", 0) and (now - rec["last_active"]) > _TTL_SECONDS]
+def _managed_root_port(pid: int, expected_port: int | None = None) -> int | None:
+    """Return the port only for an exact OpenEyes Chromium root command line."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            parts = [part.decode(errors="surrogateescape") for part in f.read().split(b"\0") if part]
+        executable = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    # Chromium may rewrite the root process's entire argv block into one
+    # space-separated process title. Support both that production form and
+    # the normal NUL-separated procfs representation.
+    args = parts[0].split() if len(parts) == 1 else parts
+    allowed_names = {
+        "chrome", "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+    }
+    if (not args or os.path.basename(args[0]) not in allowed_names
+            or os.path.basename(executable) not in allowed_names):
+        return None
+    if any(arg == "--type" or arg.startswith("--type=") for arg in args[1:]):
+        return None
+    port_args = [arg for arg in args[1:] if arg.startswith("--remote-debugging-port=")]
+    if len(port_args) != 1:
+        return None
+    try:
+        port = int(port_args[0].split("=", 1)[1])
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535 or (expected_port is not None and port != expected_port):
+        return None
+    profile = f"--user-data-dir=/tmp/openeyes-web-chrome-{port}"
+    profile_args = [arg for arg in args[1:] if arg.startswith("--user-data-dir=")]
+    if profile_args != [profile]:
+        return None
+    return port
 
-    for sid in expired:
-        rec = data[sid]
+
+def _process_age(pid: int) -> float | None:
+    """Read process age from Linux procfs without adding a psutil dependency."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        started = int(fields[19]) / os.sysconf("SC_CLK_TCK")
+        return max(0.0, uptime - started)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _managed_roots() -> list[dict]:
+    roots = []
+    try:
+        pids = (int(name) for name in os.listdir("/proc") if name.isdigit())
+        for pid in pids:
+            port = _managed_root_port(pid)
+            if port is not None:
+                roots.append({"pid": pid, "port": port, "age": _process_age(pid)})
+    except OSError:
+        pass
+    return roots
+
+
+def _wait_pidfd_exit(pidfd: int, timeout: float) -> bool:
+    """Wait boundedly for a pidfd to report process exit."""
+    try:
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                events = poller.poll(max(1, int(remaining * 1000)))
+            except InterruptedError:
+                continue
+            if events:
+                # Linux pidfds become readable (POLLIN) when the process exits.
+                # Treat error-only events as failures, not proof of exit.
+                return any(mask & select.POLLIN for _, mask in events)
+    except (OSError, ValueError):
+        return False
+
+
+def _signal_managed_root(pid: int, port: int) -> str:
+    """SIGTERM an exact managed root by pidfd and confirm that it exits."""
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        return "failed"
+    try:
+        pidfd = pidfd_open(pid, 0)
+    except OSError:
+        return "failed"
+    try:
+        # The pidfd pins process identity.  Validate the exact command line only
+        # after acquiring it so PID reuse cannot redirect the subsequent signal.
+        if _managed_root_port(pid, port) != port:
+            return "mismatch"
+        try:
+            pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+        except OSError:
+            return "failed"
+        if not _wait_pidfd_exit(pidfd, _PROCESS_EXIT_TIMEOUT):
+            return "timeout"
+        return "exited"
+    finally:
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
+
+
+def _cleanup_managed_processes(now: float | None = None) -> list[str]:
+    """Reclaim expired tracked and old untracked managed Chromium roots."""
+    now = time.time() if now is None else now
+    reclaimed_sessions: list[str] = []
+    with _session_lock():
+        data = _load_sessions()
+        roots = _managed_roots()
+        tracked_ports = {rec.get("port") for rec in data.values()}
+        processed_pids: set[int] = set()
+        changed = False
+
+        for sid, rec in list(data.items()):
+            last_active = rec.get("last_active", 0)
+            if not last_active or now - last_active <= _TTL_SECONDS:
+                continue
+            port = rec.get("port")
+            pid = rec.get("chrome_pid")
+            status = "mismatch"
+            if isinstance(port, int):
+                candidates = [root for root in roots if root["port"] == port]
+                matching = next((root for root in candidates if root["pid"] == pid), None)
+                target = matching or (candidates[0] if len(candidates) == 1 else None)
+                if target is not None:
+                    processed_pids.add(target["pid"])
+                    status = _signal_managed_root(target["pid"], port)
+                elif not candidates and not _port_listening(port):
+                    status = "gone"
+            if status in {"exited", "gone"}:
+                data.pop(sid, None)
+                reclaimed_sessions.append(sid)
+                changed = True
+                print(f"[openeyes-web] Reclaimed idle session '{sid}'", file=sys.stderr)
+
+        for root in roots:
+            pid, port, age = root["pid"], root["port"], root["age"]
+            if pid in processed_pids or port in tracked_ports:
+                continue
+            if age is not None and age > _TTL_SECONDS:
+                status = _signal_managed_root(pid, port)
+                if status == "exited":
+                    print(f"[openeyes-web] Reclaimed untracked Chrome pid={pid} port={port}", file=sys.stderr)
+
+        if changed:
+            _save_sessions(data)
+
+    return reclaimed_sessions
+
+
+async def _cleanup_expired() -> None:
+    reclaimed = await asyncio.to_thread(_cleanup_managed_processes)
+    for sid in reclaimed:
         browser = _browsers.get(sid)
-        pid = rec.get("chrome_pid")
         if browser:
             try:
-                await browser.close(kill_chrome=True)
-            except Exception as e:
-                print(f"[openeyes-web] Failed to close session {sid}: {e}", file=sys.stderr)
-        elif pid:
-            # Session known from persisted state but no BrowserManager in memory
-            # (e.g., server restarted). Kill Chrome directly.
-            import signal
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
+                await browser.close()
+            except Exception:
                 pass
-            except Exception as e:
-                print(f"[openeyes-web] Failed to kill pid {pid} for session {sid}: {e}", file=sys.stderr)
         _drop_session_state(sid)
-        _remove_session_record(sid)
-        print(f"[openeyes-web] Reclaimed idle session '{sid}' (idle {int(now - rec.get('last_active', 0))}s)", file=sys.stderr)
 
 
 def _sweep_history() -> None:
@@ -1078,6 +1268,12 @@ def serve():
     """All-in-one: MCP server + dashboard + browser. One command to run everything."""
     sys.argv = [sys.argv[0], "serve"]
     main()
+
+
+def cleanup():
+    """Run one serialized browser and screenshot-history cleanup pass."""
+    _cleanup_managed_processes()
+    _sweep_history()
 
 
 if __name__ == "__main__":

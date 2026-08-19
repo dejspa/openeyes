@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import http.server
 import json
 import os
@@ -11,7 +10,6 @@ import sys
 import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 
 import websockets
 
@@ -20,18 +18,6 @@ HTTP_PORT = 6080
 WS_PORT = 6081
 SESSION_FILE = "/tmp/openeyes-web-sessions.json"
 HISTORY_ROOT = os.path.expanduser("~/.openeyes/web/history")
-
-
-@contextmanager
-def _session_lock():
-    """Same flock the MCP server uses — the session file is shared across processes."""
-    lf = open(SESSION_FILE + ".lock", "w")
-    try:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(lf, fcntl.LOCK_UN)
-        lf.close()
 
 
 def _load_sessions() -> dict:
@@ -510,6 +496,49 @@ setInterval(poll,2000);poll();
 </html>""".replace('__WS_PORT__', str(WS_PORT))
 
 
+def _list_live_sessions() -> list[dict]:
+    """Return reachable sessions without mutating the lifecycle registry."""
+    try:
+        from .server import get_sessions
+        sessions = get_sessions()
+    except Exception:
+        import time as _t
+        data = _load_sessions()
+        now = _t.time()
+        sessions = []
+        for sid, rec in data.items():
+            last = rec.get("last_active", 0)
+            sessions.append({
+                "id": sid,
+                "port": rec.get("port"),
+                "last_active": last,
+                "idle_seconds": int(now - last) if last else None,
+                "active": False,
+            })
+        sessions.sort(key=lambda r: -(r["last_active"] or 0))
+
+    def _ping(port):
+        try:
+            urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=0.3)
+            return True
+        except Exception:
+            return False
+
+    pingable = [s for s in sessions if s.get("port") is not None]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        alive = list(pool.map(_ping, [s["port"] for s in pingable]))
+    live = [s for s, ok in zip(pingable, alive) if ok]
+
+    if not live:
+        try:
+            urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version", timeout=0.3)
+            live = [{"id": "default", "port": CDP_PORT, "last_active": 0,
+                     "idle_seconds": None, "active": False}]
+        except Exception:
+            pass
+    return live
+
+
 class _HTTPHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress request logs
@@ -529,62 +558,10 @@ class _HTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == '/api/sessions':
-            # Return live sessions only — ping each CDP port and drop dead ones
-            # (so closing all tabs in a session makes it vanish from the UI).
-            try:
-                from .server import get_sessions
-                sessions = get_sessions()
-            except Exception:
-                import time as _t
-                data = _load_sessions()
-                now = _t.time()
-                sessions = []
-                for sid, rec in data.items():
-                    last = rec.get("last_active", 0)
-                    sessions.append({
-                        "id": sid,
-                        "port": rec.get("port"),
-                        "last_active": last,
-                        "idle_seconds": int(now - last) if last else None,
-                        "active": False,
-                    })
-                sessions.sort(key=lambda r: -(r["last_active"] or 0))
-            # Ping each port concurrently; reap dead sessions from the session file.
-            def _ping(port):
-                try:
-                    urllib.request.urlopen(f'http://localhost:{port}/json/version', timeout=0.3)
-                    return True
-                except Exception:
-                    return False
-
-            pingable = [s for s in sessions if s.get("port") is not None]
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                alive = list(pool.map(_ping, [s["port"] for s in pingable]))
-            live = [s for s, ok in zip(pingable, alive) if ok]
-            dead_ids = [s["id"] for s, ok in zip(pingable, alive) if not ok]
-            if dead_ids:
-                try:
-                    with _session_lock():
-                        persisted = _load_sessions()
-                        reaped = False
-                        for sid in dead_ids:
-                            if persisted.pop(sid, None) is not None:
-                                reaped = True
-                        if reaped:
-                            tmp = SESSION_FILE + ".tmp"
-                            with open(tmp, "w") as f:
-                                json.dump(persisted, f)
-                            os.replace(tmp, SESSION_FILE)
-                except Exception:
-                    pass
-            # Back-compat: if nothing is persisted but the legacy CDP port is up, show it.
-            if not live:
-                try:
-                    urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=0.3)
-                    live = [{"id": "default", "port": CDP_PORT, "last_active": 0, "idle_seconds": None, "active": False}]
-                except Exception:
-                    pass
-            body = json.dumps(live).encode()
+            # Return reachable sessions only; unreachable records remain persisted.
+            # Ping each port concurrently. Listing is deliberately read-only:
+            # a transient health-check failure must not destroy lifecycle state.
+            body = json.dumps(_list_live_sessions()).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
