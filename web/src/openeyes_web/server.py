@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from mcp.server.fastmcp import FastMCP, Context, Image as MCPImage
 
 from .browser import BrowserManager
+from .devtools import format_element, format_storage, format_resources, window_lines
 from .tracker import PageMemory
 from .vision import VisionPipeline, estimate_image_tokens
 
@@ -46,6 +47,17 @@ TOOLS:
 - switch_tab(index) — switch to a tab by index
 - list_tabs() — show all open tabs
 - close_tab(index) — close a tab
+
+DEVTOOLS — for debugging a site, not for ordinary browsing (costs tokens):
+- devtools("on"|"off"|"clear"|"status") — record console + network traffic. OFF by default.
+  While on, each action reply ends with "DevTools: 2 API requests; 1 failed: POST /api/x → 500; …".
+- get_console(level, since) / get_network(types, since, contains) — what your LAST action
+  caused by default (since="action"); since="all" for the whole buffer.
+- get_request(id) — one request in full: headers, request body, response body.
+- inspect_element(x, y | selector) — Elements panel: attributes, box, styles, and what COVERS it.
+- get_storage(kind) — localStorage, sessionStorage, cookies, IndexedDB.
+- get_source(url) — page HTML, or a loaded script/stylesheet ("list" to see them).
+The last three need no recording. Secrets (cookies, tokens) are masked unless reveal=true.
 
 HOW CLICKING WORKS:
 - Look at the screenshot and estimate the (x, y) pixel coordinates of what you want to click.
@@ -84,6 +96,11 @@ STRATEGY GUIDE — follow these patterns for best results:
    new_tab("https://a.com") → work there → new_tab("https://b.com") → work there →
    switch_tab(0) to return to the first. Tabs persist across calls — open as many as
    you need, one per site/topic. Use list_tabs() to see what's already open.
+
+6. DEBUG A SITE (e.g. "why doesn't the login form work", "what does the app call on save"):
+   devtools("on") → act as usual → read the DevTools summary → get_network() / get_console()
+   → get_request(id) for one call's bodies → devtools("off") when done.
+   Click does nothing? inspect_element(x, y). Login state / flags? get_storage().
 
 PRODUCT SELECTION — think like a human:
 - "fryst lax" means salmon fillets, NOT salmon burgers or salmon sausage.
@@ -537,6 +554,18 @@ def _get_memory(session_id: str) -> PageMemory:
     return _memory[session_id]
 
 
+def _dt_mark(browser: BrowserManager) -> None:
+    """An agent action is starting: remember where the DevTools buffers are, so
+    the default "since my last action" views show only what this action caused."""
+    browser.devtools.mark_action()
+
+
+def _dt_summary(browser: BrowserManager) -> str:
+    """One-line DevTools digest appended to action replies. Empty when off."""
+    line = browser.devtools.summary(browser.active_tab_key)
+    return f"\n{line}" if line else ""
+
+
 async def _capture(session_id: str) -> tuple[bytes, bytes | None, str, float]:
     """Take screenshot, process it.
 
@@ -934,6 +963,7 @@ async def set_device(device: str, ctx: Context) -> list:
     open tab; new tabs inherit it. Example: set_device("mobile") then screenshot()."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    _dt_mark(browser)
     res = await browser.set_device(device)
     if not res.get("ok"):
         return _track([res.get("error", "Failed to set device.")], sid)
@@ -941,7 +971,7 @@ async def set_device(device: str, ctx: Context) -> list:
     result = [MCPImage(data=img, format="jpeg")]
     kind = "mobile" if res["mobile"] else "desktop"
     result.append(f"Device set to '{res['device']}' ({res['w']}×{res['h']}, {kind}) | "
-                  f"URL: {browser.current_url}\n{context}")
+                  f"URL: {browser.current_url}\n{context}{_dt_summary(browser)}")
     return _track(result, sid)
 
 
@@ -953,6 +983,7 @@ async def navigate(url: str, ctx: Context) -> list:
     Examples: navigate("linkedin") → switches to LinkedIn tab. navigate("https://di.se/article/...") → opens in current tab."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    _dt_mark(browser)
     status = await browser.navigate(url)
     img, crop, context, _ = await _capture(sid)
     title = await browser.get_page_title()
@@ -960,7 +991,7 @@ async def navigate(url: str, ctx: Context) -> list:
     tabs = browser.list_tabs()
     tab_info = " | ".join(f"[{t['index']}{'*' if t['active'] else ''}]{' 📌'+t['pin'] if t['pin'] else ''} {t['url'][:30]}" for t in tabs)
     dev = f"\nDevice: {browser.current_device}" if browser.current_device != "desktop" else ""
-    text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}{dev}\nTabs: {tab_info}"
+    text = f"{status}\n{context}\n\nURL: {browser.current_url}\nTitle: {title}{dev}\nTabs: {tab_info}{_dt_summary(browser)}"
     result.append(text)
     return _track(result, sid)
 
@@ -982,6 +1013,7 @@ async def click(x: int, y: int, ctx: Context) -> list:
     y = max(0, min(y, ah - 1))
     vx, vy = int(x * vw / aw), int(y * vh / ah)
 
+    _dt_mark(browser)
     result = await browser.click_at_point(vx, vy)
 
     if result["found"]:
@@ -1008,7 +1040,7 @@ async def click(x: int, y: int, ctx: Context) -> list:
 
     img, crop, context, diff_ratio = await _capture(sid)
     return _track(_build_response(img, crop, context,
-                           f"{desc}\nURL: {browser.current_url}",
+                           f"{desc}\nURL: {browser.current_url}{_dt_summary(browser)}",
                            diff_ratio, show_tiny_changes=True), sid)
 
 
@@ -1020,17 +1052,18 @@ async def type_text(text: str, ctx: Context, press_enter: bool = False, clear_fi
     Set press_enter=true to submit (may navigate to new page)."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    _dt_mark(browser)
     await browser.type_text(text, press_enter=press_enter, clear_first=clear_first)
 
     if press_enter:
         # Pressing enter may navigate — return screenshot
         img, crop, context, diff_ratio = await _capture(sid)
         return _track(_build_response(img, crop, context,
-                               f"Typed: '{text}' + Enter | URL: {browser.current_url}",
+                               f"Typed: '{text}' + Enter | URL: {browser.current_url}{_dt_summary(browser)}",
                                diff_ratio), sid)
 
     # No enter — page barely changed. Text-only response saves ~800 tokens.
-    return _track([f"Typed: '{text}' into focused element.\nURL: {browser.current_url}\n\nUse screenshot() to see the current page if needed."], sid)
+    return _track([f"Typed: '{text}' into focused element.\nURL: {browser.current_url}{_dt_summary(browser)}\n\nUse screenshot() to see the current page if needed."], sid)
 
 
 @mcp.tool()
@@ -1039,16 +1072,17 @@ async def scroll(ctx: Context, direction: str = "down") -> list:
     """Scroll the page. Direction: 'up' or 'down'."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    _dt_mark(browser)
     await browser.scroll(direction)
 
     img, crop, context, diff_ratio = await _capture(sid)
 
     if diff_ratio < 0.02:
         # Nothing new appeared — probably at top/bottom of page
-        return _track([f"Scrolled {direction} — no new content visible (may have reached the {'bottom' if direction == 'down' else 'top'}).\nURL: {browser.current_url}"], sid)
+        return _track([f"Scrolled {direction} — no new content visible (may have reached the {'bottom' if direction == 'down' else 'top'}).\nURL: {browser.current_url}{_dt_summary(browser)}"], sid)
 
     return _track(_build_response(img, crop, context,
-                           f"Scrolled {direction} | URL: {browser.current_url}",
+                           f"Scrolled {direction} | URL: {browser.current_url}{_dt_summary(browser)}",
                            diff_ratio), sid)
 
 
@@ -1072,11 +1106,12 @@ async def go_back(ctx: Context) -> list:
     """Go back to the previous page."""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    _dt_mark(browser)
     await browser.back()
     img, crop, context, _ = await _capture(sid)
     # Always full screenshot for navigation
     result = [MCPImage(data=img, format="jpeg")]
-    result.append(f"{context}\n\nWent back | URL: {browser.current_url}")
+    result.append(f"{context}\n\nWent back | URL: {browser.current_url}{_dt_summary(browser)}")
     return _track(result, sid)
 
 
@@ -1115,13 +1150,14 @@ async def new_tab(ctx: Context, url: str = "about:blank", pin: str = "", force_n
     and protect it from close_tab. Example: new_tab("https://linkedin.com", pin="linkedin")"""
     sid = _session_id(ctx)
     browser = await _get_browser(sid)
+    _dt_mark(browser)
     index = await browser.new_tab(url, pin=pin, force_new=force_new)
     img, crop, context, _ = await _capture(sid)
     tabs = browser.list_tabs()
     tab_info = "\n".join(f"  [{t['index']}] {'📌'+t['pin']+' ' if t['pin'] else ''}{'→ ' if t['active'] else '  '}{t['url']}" for t in tabs)
     result = [MCPImage(data=img, format="jpeg")]
     pin_msg = f" (pinned as '{pin}')" if pin else ""
-    result.append(f"{context}\n\nOpened tab {index}{pin_msg} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}")
+    result.append(f"{context}\n\nOpened tab {index}{pin_msg} | URL: {browser.current_url}\n\nAll tabs:\n{tab_info}{_dt_summary(browser)}")
     return _track(result, sid)
 
 
@@ -1188,6 +1224,222 @@ async def close_tab(index: int, ctx: Context) -> list:
     result = [MCPImage(data=img, format="jpeg")]
     result.append(f"Closed tab {index}\n\nAll tabs:\n{tab_info}")
     return _track(result, sid)
+
+
+# ---------------------------------------------------------------------------
+# DevTools — opt-in console + network capture (see devtools.py)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@_guard
+async def devtools(mode: str, ctx: Context) -> str:
+    """Record the browser's console and network traffic (OFF by default — only for
+    debugging a site; it costs tokens). While on, every action reply ends with a
+    one-line "DevTools:" summary; read details with get_console/get_network/get_request.
+    mode: "on" (start, buffers reset) | "off" (stop, discard) | "clear" | "status" """
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    dt = browser.devtools
+    m = (mode or "").strip().lower()
+    if m in ("on", "enable", "start", "true", "1"):
+        browser.set_devtools(True)
+        msg = ("DevTools ON — recording console and network for all tabs. Do an action, "
+               "then call get_network() / get_console() to see what it caused "
+               "(or get_network(since=\"all\") for everything). Call devtools(\"off\") when done.")
+    elif m in ("off", "disable", "stop", "false", "0"):
+        browser.set_devtools(False)
+        msg = "DevTools OFF — buffers discarded."
+    elif m in ("clear", "reset"):
+        dt.clear()
+        msg = "DevTools buffers cleared." if dt.enabled else "DevTools is off (nothing to clear)."
+    elif m in ("status", ""):
+        msg = dt.status_line()
+    else:
+        msg = f"Unknown mode '{mode}' — use on, off, clear or status."
+    _track([msg], sid)
+    return msg
+
+
+@mcp.tool()
+@_guard
+async def get_console(ctx: Context, level: str = "all", since: str = "action",
+                      limit: int = 50, all_tabs: bool = False) -> str:
+    """Console output + uncaught JS exceptions (requires devtools("on")).
+    level: "all" | "error" | "warn" (warn+error) | "log".  since: "action" (only what
+    your last action caused) | "all".  limit: newest N (0 = all).  all_tabs: not just
+    the active tab."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    dt = browser.devtools
+    if not dt.enabled:
+        msg = "DevTools is off — call devtools(\"on\") first, then repeat the action you want to inspect."
+        _track([msg], sid)
+        return msg
+    tab = None if all_tabs else browser.active_tab_key
+    entries = dt.console_entries(tab, level=level, since=since, limit=limit)
+    scope = "since last action" if since == "action" else "all buffered"
+    head = f"Console ({scope}, level={level}, {len(entries)} lines) | URL: {browser.current_url}"
+    body = dt.format_console(entries)
+    if not entries and since == "action":
+        body += " — try since=\"all\" for earlier output."
+    msg = f"{head}\n{body}"
+    _track([msg], sid)
+    return msg
+
+
+@mcp.tool()
+@_guard
+async def get_network(ctx: Context, types: str = "api", since: str = "action",
+                      contains: str = "", limit: int = 50, all_tabs: bool = False) -> str:
+    """HTTP requests the page made, one line each: #id, method, URL, status, type,
+    size, duration (requires devtools("on")). Use #id with get_request(id).
+    types: "api" (xhr/fetch/document; hides images/CSS/fonts/scripts) | "all" |
+    "failed" (errors + status ≥ 400) | "xhr,image,…".  since: "action" | "all".
+    contains: URL substring.  limit: newest N (0 = all).  all_tabs: not just active."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    dt = browser.devtools
+    if not dt.enabled:
+        msg = "DevTools is off — call devtools(\"on\") first, then repeat the action you want to inspect."
+        _track([msg], sid)
+        return msg
+    tab = None if all_tabs else browser.active_tab_key
+    entries = dt.network_entries(tab, types=types, since=since, contains=contains, limit=limit)
+    scope = "since last action" if since == "action" else "all buffered"
+    filt = f", contains='{contains}'" if contains else ""
+    head = f"Network ({scope}, types={types}{filt}, {len(entries)} requests) | Page: {browser.current_url}"
+    body = dt.format_network(entries)
+    if not entries:
+        hints = []
+        if since == "action":
+            hints.append("since=\"all\"")
+        if types == "api":
+            hints.append("types=\"all\"")
+        if hints:
+            body += " — try " + " or ".join(hints) + "."
+    msg = f"{head}\n{body}\nUse get_request(id) for headers and bodies."
+    _track([msg], sid)
+    return msg
+
+
+@mcp.tool()
+@_guard
+async def get_request(id: int, ctx: Context, headers: bool = True, reveal: bool = False) -> str:
+    """One request in full (requires devtools("on")): status, timing, request/response
+    headers, request body, and the response body for API responses (≤16KB). id is the
+    #number from get_network(). headers=false saves tokens. Cookies, tokens and
+    password-like fields are masked as "…(N chars)" unless reveal=true."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    dt = browser.devtools
+    if not dt.enabled:
+        msg = "DevTools is off — call devtools(\"on\") first."
+        _track([msg], sid)
+        return msg
+    entry = dt.find_request(id)
+    if entry is None:
+        msg = f"No request #{id} in the buffer — run get_network() to see current ids."
+        _track([msg], sid)
+        return msg
+    msg = dt.format_request(entry, include_headers=headers, reveal=reveal)
+    _track([msg], sid)
+    return msg
+
+
+@mcp.tool()
+@_guard
+async def inspect_element(ctx: Context, x: int | None = None, y: int | None = None,
+                          selector: str = "", html_chars: int = 2000) -> str:
+    """Elements panel for one DOM element (no recording needed). Give screenshot
+    coordinates (x, y) — same as click() — or a CSS selector. Returns tag/id/class,
+    attributes, box, text, value/state, key computed styles, ancestors, outerHTML
+    (≤html_chars), the stack of elements under the point, and "Covered by: …" when
+    another element sits on top — the usual reason a click "does nothing"."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    vision = _get_vision(sid)
+    vw, vh = browser.viewport_size
+    aw, ah = vision.display_size(vw, vh)
+    scale = (aw / vw, ah / vh)
+    try:
+        if selector:
+            info = await browser.inspect_element(selector=selector, html_limit=max(0, html_chars))
+        elif x is not None and y is not None:
+            x = max(0, min(x, aw - 1)); y = max(0, min(y, ah - 1))
+            info = await browser.inspect_element(int(x * vw / aw), int(y * vh / ah),
+                                                 html_limit=max(0, html_chars))
+        else:
+            info = {"error": "Give either (x, y) screenshot coordinates or a CSS selector."}
+    except Exception as e:
+        info = {"error": f"Could not inspect: {str(e).split(chr(10), 1)[0][:200]}"}
+    msg = format_element(info, scale) + f"\nURL: {browser.current_url}"
+    _track([msg], sid)
+    return msg
+
+
+@mcp.tool()
+@_guard
+async def get_storage(ctx: Context, kind: str = "all", contains: str = "",
+                      reveal: bool = False) -> str:
+    """Application panel for the active tab's origin (no recording needed):
+    localStorage, sessionStorage, cookies (name, domain, flags, expiry), IndexedDB
+    and Cache Storage names. kind: "all" | "local" | "session" | "cookies" |
+    "indexeddb" | "cache".  contains: key/name substring.  Cookie values and
+    secret-looking keys (token, auth, session, …) are masked unless reveal=true."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    k = (kind or "all").strip().lower()
+    k = {"localstorage": "local", "sessionstorage": "session", "cookie": "cookies",
+         "idb": "indexeddb"}.get(k, k)
+    if k not in ("all", "local", "session", "cookies", "indexeddb", "cache"):
+        msg = f"Unknown kind '{kind}' — use all, local, session, cookies, indexeddb or cache."
+        _track([msg], sid)
+        return msg
+    try:
+        res = await browser.get_storage(k, contains=contains)
+    except Exception as e:
+        msg = f"Could not read storage: {str(e).split(chr(10), 1)[0][:200]}"
+        _track([msg], sid)
+        return msg
+    msg = format_storage(res, k, reveal=reveal)
+    _track([msg], sid)
+    return msg
+
+
+@mcp.tool()
+@_guard
+async def get_source(ctx: Context, url: str = "", start: int = 1, lines: int = 150) -> str:
+    """Sources panel (no recording needed). url: "" → the page's live HTML (DOM after
+    JS ran) | "list" → every loaded script/stylesheet/document | a URL substring
+    ("app.js") → that resource's content. start/lines: 1-based line window (default
+    1–150; output capped at ~12K chars, so use small windows for minified files)."""
+    sid = _session_id(ctx)
+    browser = await _get_browser(sid)
+    u = (url or "").strip()
+    try:
+        if u.lower() == "list":
+            resources = await browser.list_resources()
+            msg = (f"Loaded resources for {browser.current_url} ({len(resources)}):\n"
+                   + format_resources(resources, browser.current_url)
+                   + "\nUse get_source(url=<substring>) to read one.")
+        elif not u:
+            html = await browser.page_html()
+            msg = f"Live HTML of {browser.current_url}:\n" + window_lines(html, start, lines)
+        else:
+            match, content, hits = await browser.get_resource(u)
+            if match is None:
+                if not hits:
+                    msg = f"No loaded resource matches '{u}'. Try get_source(url=\"list\")."
+                else:
+                    msg = (f"'{u}' matches {len(hits)} resources — be more specific:\n"
+                           + format_resources(hits, browser.current_url))
+            else:
+                head = f"{match['url']}  [{match['type']}, {match.get('mime') or '?'}]"
+                msg = head + "\n" + window_lines(content or "", start, lines)
+    except Exception as e:
+        msg = f"Could not read source: {str(e).split(chr(10), 1)[0][:200]}"
+    _track([msg], sid)
+    return msg
 
 
 def _start_dashboard():

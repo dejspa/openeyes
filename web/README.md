@@ -174,7 +174,7 @@ Each agent gets a completely isolated Chrome instance. Tabs and login sessions p
 
 See [SKILL.md](SKILL.md) for integration with Codex CLI, Gemini CLI, and other agent harnesses.
 
-Works with any MCP-compatible agent. The 13 tools appear automatically after connecting.
+Works with any MCP-compatible agent. The 20 tools appear automatically after connecting.
 
 ## Environment variables
 
@@ -202,6 +202,60 @@ Works with any MCP-compatible agent. The 13 tools appear automatically after con
 | `switch_tab(index)` | Switch to a tab by index |
 | `list_tabs()` | Show all open tabs |
 | `close_tab(index)` | Close a tab |
+| `devtools(mode)` | `"on"` / `"off"` / `"clear"` / `"status"` — opt-in console + network recording (off by default) |
+| `get_console(level, since)` | Console output and uncaught JS errors (needs devtools on) |
+| `get_network(types, since, contains)` | HTTP requests: method, URL, status, type, size, timing (needs devtools on) |
+| `get_request(id, headers, reveal)` | One request in full: headers, request body, response body (needs devtools on) |
+| `inspect_element(x, y)` / `inspect_element(selector)` | Elements panel: attributes, box, computed styles, ancestors, outerHTML, what covers it |
+| `get_storage(kind, contains, reveal)` | Application panel: localStorage, sessionStorage, cookies, IndexedDB, Cache Storage |
+| `get_source(url, start, lines)` | Sources panel: live page HTML, or any loaded script/stylesheet (`"list"` to enumerate) |
+
+## DevTools mode (debugging a site)
+
+Off by default so ordinary browsing never pays for it. When the agent is *developing or debugging* a site — a form that does nothing, an API that fails, "what does the app call when I click save?" — it turns the recorder on itself:
+
+```
+devtools("on")                 → start recording console + network for every tab
+navigate / click / type …      → each reply now ends with one line, e.g.
+                                 DevTools: 2 API requests; 1 failed: POST /api/cart → 500; 1 console error: Uncaught TypeError …
+get_network()                  → the requests the LAST action caused (xhr/fetch/document; assets hidden)
+get_network(types="all")       →   … including images, CSS, fonts, scripts
+get_network(types="failed")    →   … only errors and status ≥ 400
+get_network(since="all")       →   … everything since devtools went on
+get_console(level="error")     → console errors + uncaught exceptions from the last action
+get_request(7)                 → full headers, request payload and response body for request #7
+devtools("off")                → stop and discard
+```
+
+What the agent gets:
+
+- **Console** — `console.log/info/warn/error` lines with source location, plus uncaught exceptions (`Uncaught ReferenceError: …`). Filter by level; default scope is "since my last action".
+- **Network** — one compact line per request: `#12 14:03:05 POST /api/save → 500 (json, 1.2KB, 340ms)`. Failed requests show the network error (`✗ net::ERR_CONNECTION_REFUSED`), unanswered ones show `… pending`.
+- **Request detail** — request and response headers, the request body (form/JSON payload) and the response body for API-style responses (xhr/fetch, or anything JSON), capped at 16 KB.
+- **Secrets are masked by default.** Headers, cookies, storage keys and JSON/form fields whose name looks secret (`cookie`, `auth`, `token`, `secret`, `passw`, `session`, `api-key`, `jwt`, `csrf`, …) show only the scheme and length — `authorization: Bearer …(28 chars)`, `cookie: sid=…(26 chars); theme=…(4 chars)`, `"password":"…(7 chars)"` — so the agent sees *that* auth was sent and how long it is, but the value never enters the model context or logs. `get_request(id, reveal=true)` / `get_storage(reveal=true)` show the raw values when the debugging genuinely needs them.
+
+### Elements, Application and Sources — no recording needed
+
+These three are pull-based: they cost nothing until called, so they work whether or not the recorder is on.
+
+```
+inspect_element(x=450, y=300)              → what's at those screenshot coordinates (same coords as click)
+inspect_element(selector="#login button")  → … or the first match of a CSS selector
+get_storage()                              → localStorage, sessionStorage, cookies, IndexedDB, Cache Storage
+get_storage(kind="local", contains="token")
+get_source(url="list")                     → every loaded script/stylesheet/document
+get_source(url="app.js", start=1, lines=150)
+get_source()                               → the page's live HTML (the DOM after JS ran)
+```
+
+`inspect_element` returns tag/id/class, attributes, the box in screenshot pixels, text, value/checked/disabled, href, the computed styles that matter (`display`, `position`, `visibility`, `opacity`, `z-index`, `pointer-events`, …), the ancestor chain, child count and a capped `outerHTML`. Two things make it useful for "the click does nothing":
+
+- **`Covered by: div#overlay`** — another element sits on top, so clicks hit that instead.
+- **`Stack at point (top → bottom): div#overlay > button#save > form#login`** — everything under the coordinates, so the agent sees the button hiding under the overlay.
+
+For coordinates it also describes the *interactive wrapper* (the `<button>`/`<a>` the hit `<span>` belongs to), and it pierces shadow DOM.
+
+Implementation: Playwright `console`/`pageerror`/`request`/`response`/`requestfailed` events feed bounded ring buffers (500 entries each, per session). Listeners are attached only while recording is on — Playwright subscribes the Node driver to those events on the first listener, so an always-on listener would have every request and console line serialized to Python even when nobody reads it. Off really means off. Headers and bodies are fetched in the background (bounded concurrency, 5 s timeout, assets skipped), so a chatty page can't block the event loop. Element and storage inspection are single `page.evaluate` calls; sources come from CDP `Page.getResourceContent` (Chrome's own cache of what it loaded); binary resources are never dumped.
 
 ## Device emulation (desktop / mobile)
 
@@ -217,6 +271,7 @@ Not every action needs a screenshot:
 - **`click` with no page change** → text-only feedback: "Clicked: \<button> 'Add to cart'"
 - **Minor change (modal opened)** → only the changed region is sent, not the full page
 - **`scroll` at bottom of page** → text-only: "No new content visible"
+- **DevTools off by default** → console/network capture only costs tokens when the agent explicitly turns it on to debug
 
 ## Token benchmark (measured)
 
