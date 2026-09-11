@@ -70,6 +70,13 @@ openclaw mcp set openeyes-web '{"url":"http://localhost:6090/sse"}'
 | `switch_tab` | `index` | Switch to a tab by index. |
 | `list_tabs` | — | Show all open tabs. |
 | `close_tab` | `index` | Close a tab by index (cannot close pinned tabs). |
+| `devtools` | `mode` | `"on"` / `"off"` / `"clear"` / `"status"`. Opt-in console + network recording. **Off by default.** |
+| `get_console` | `level`, `since`, `limit`, `all_tabs` | Console output and uncaught JS errors. Needs `devtools("on")`. |
+| `get_network` | `types`, `since`, `contains`, `limit`, `all_tabs` | HTTP requests with method, URL, status, size, timing. Needs `devtools("on")`. |
+| `get_request` | `id`, `headers`, `reveal` | One request in full: headers, request body, response body. Needs `devtools("on")`. |
+| `inspect_element` | `x`, `y` or `selector`, `html_chars` | Elements panel: attributes, box, computed styles, ancestors, outerHTML, and what covers it. Works anytime. |
+| `get_storage` | `kind`, `contains`, `reveal` | Application panel: localStorage, sessionStorage, cookies, IndexedDB, Cache Storage. Works anytime. |
+| `get_source` | `url`, `start`, `lines` | Sources panel: live page HTML (`""`), resource list (`"list"`), or a loaded script/stylesheet by URL substring. Works anytime. |
 
 ## How Clicking Works
 
@@ -106,6 +113,21 @@ Use `get_text` for article content — don't read long text from screenshots.
 screenshot → scroll → screenshot → scroll (repeat)
 ```
 Use `get_text` on interesting items.
+
+### 5. DEBUG A SITE (e.g. "why does the login form do nothing", "what does the app call when I click save", "check localhost:3000 for console errors")
+```
+devtools("on") → navigate/click as usual → read the "DevTools:" summary line on each reply
+→ get_network() / get_console() for what that action caused → get_request(id) for headers + bodies
+→ devtools("off") when done
+```
+DevTools is **off by default** because it costs tokens. Turn it on only when you need to see console output or network traffic — a page misbehaves, you're developing a site, or you must know what an action sent and received. By default `get_console`/`get_network` show only what your **last action** caused; use `since="all"` for the whole buffer, `types="all"` to include images/CSS/scripts, `types="failed"` for errors only.
+
+`inspect_element`, `get_storage` and `get_source` need no recording — call them whenever you need them:
+- A click "does nothing"? `inspect_element(x, y)` shows what is really at that point, the stack of elements under it, and whether an overlay covers the button.
+- Wrong login state, stale data, a feature flag? `get_storage()` shows localStorage, sessionStorage, cookies and IndexedDB for the page's origin.
+- Need to read the page's actual HTML or a loaded script? `get_source()` / `get_source(url="app.js")` — page through with `start`/`lines`.
+
+Cookies, tokens, passwords and similar secrets are masked as `…(N chars)` in headers, bodies and storage. You still see *that* they were sent and how long they are; pass `reveal=true` only when the actual value is needed for the bug.
 
 ## Important Behaviors
 

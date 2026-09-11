@@ -14,6 +14,8 @@ import time
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
+from .devtools import DevToolsRecorder
+
 # OPENEYES_WEB_FAST=1 forces the human-mimicking delays off everywhere. By default
 # we skip them only on localhost / IP-literal hosts (assumed dev servers we own) and
 # keep them for real websites, where instant robotic timing is a bot tell.
@@ -276,6 +278,142 @@ _CLICK_SNAP_JS = """
 }
 """
 
+# Elements-panel style inspection. {x, y} in viewport px OR {selector}. Reports
+# the exact element hit, the interactive wrapper it belongs to (if different),
+# attributes, box, key computed styles, ancestors, and whether another element
+# covers it — the usual answer to "why does clicking do nothing".
+_INSPECT_JS = """
+({x, y, selector, htmlLimit}) => {
+    function deepElementFromPoint(px, py) {
+        let el = document.elementFromPoint(px, py);
+        while (el && el.shadowRoot) {
+            const inner = el.shadowRoot.elementFromPoint(px, py);
+            if (!inner || inner === el) break;
+            el = inner;
+        }
+        return el;
+    }
+    const INTERACTIVE = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA','SUMMARY','LABEL']);
+    function wrapper(el) {
+        let e = el;
+        for (let i = 0; i < 10 && e && e !== document.body; i++) {
+            if (INTERACTIVE.has(e.tagName) || e.getAttribute('role') || e.onclick
+                || e.getAttribute('onclick') || e.getAttribute('contenteditable') === 'true') return e;
+            e = e.parentElement || (e.getRootNode().host || null);
+        }
+        return null;
+    }
+    function label(e) {
+        if (!e || e.nodeType !== 1) return String(e);
+        let s = e.tagName.toLowerCase();
+        if (e.id) s += '#' + e.id;
+        const cls = (typeof e.className === 'string' ? e.className : '').trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+        if (cls.length) s += '.' + cls.join('.');
+        return s;
+    }
+    function describe(e) {
+        const r = e.getBoundingClientRect();
+        const cs = getComputedStyle(e);
+        const attrs = {};
+        for (const a of e.attributes) attrs[a.name] = a.value.length > 200 ? a.value.slice(0, 200) + '…' : a.value;
+        const styles = {};
+        for (const k of ['display','position','visibility','opacity','z-index','pointer-events','overflow',
+                         'cursor','width','height','color','background-color','font-size','font-family']) {
+            styles[k] = cs.getPropertyValue(k);
+        }
+        // What actually receives a click at this element's center?
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        let covered = null;
+        if (r.width > 0 && r.height > 0 && cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight) {
+            const top = deepElementFromPoint(cx, cy);
+            if (top && top !== e && !e.contains(top)) covered = label(top);
+        }
+        const ancestors = [];
+        let a = e.parentElement || (e.getRootNode().host || null);
+        for (let i = 0; i < 8 && a && a !== document.documentElement; i++) {
+            ancestors.push(label(a));
+            a = a.parentElement || (a.getRootNode().host || null);
+        }
+        const html = e.outerHTML || '';
+        const out = {
+            label: label(e), tag: e.tagName.toLowerCase(), attrs, styles,
+            box: {x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height)},
+            inViewport: r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth,
+            text: (e.innerText || e.textContent || '').trim().slice(0, 200),
+            children: e.children.length, covered, ancestors,
+            html: html.length > htmlLimit ? html.slice(0, htmlLimit) + '…[' + html.length + ' chars total]' : html,
+            inShadow: e.getRootNode() !== document,
+        };
+        if ('value' in e && e.tagName !== 'LI') out.value = String(e.value).slice(0, 200);
+        if ('disabled' in e) out.disabled = !!e.disabled;
+        if ('checked' in e && (e.type === 'checkbox' || e.type === 'radio')) out.checked = !!e.checked;
+        if (e.tagName === 'A') out.href = e.href;
+        if (e.tagName === 'FORM') out.form = {action: e.action, method: e.method};
+        const listeners = [];
+        for (const k of ['onclick','onsubmit','onchange','oninput','onkeydown']) if (e[k]) listeners.push(k);
+        if (listeners.length) out.inlineHandlers = listeners;
+        return out;
+    }
+    let el = null;
+    if (selector) {
+        let all;
+        try { all = document.querySelectorAll(selector); }
+        catch (e) { return {error: 'Invalid CSS selector: ' + selector + ' (' + e.message + ')'}; }
+        if (!all.length) return {error: 'No element matches selector: ' + selector};
+        el = all[0];
+        const res = describe(el);
+        res.matches = all.length;
+        return res;
+    }
+    el = deepElementFromPoint(x, y);
+    if (!el) return {error: 'Nothing at that point'};
+    const res = describe(el);
+    const w = wrapper(el);
+    if (w && w !== el) res.wrapper = describe(w);
+    // Everything stacked under the point, top to bottom — shows what an overlay hides.
+    try {
+        res.stack = document.elementsFromPoint(x, y)
+            .filter(e => e !== document.documentElement && e !== document.body)
+            .slice(0, 6).map(label);
+    } catch (e) {}
+    return res;
+}
+"""
+
+_BINARY_RESOURCE_TYPES = {"Image", "Font", "Media", "Wasm"}
+
+# Application-panel style storage dump. Values are clipped per entry.
+_STORAGE_JS = """
+async ({kind, contains, valueLimit}) => {
+    const needle = (contains || '').toLowerCase();
+    const clip = v => (v == null ? '' : String(v)).length > valueLimit ? String(v).slice(0, valueLimit) + '…' : String(v);
+    const dump = store => {
+        const out = [];
+        try {
+            for (let i = 0; i < store.length; i++) {
+                const k = store.key(i);
+                if (needle && !k.toLowerCase().includes(needle)) continue;
+                out.push([k, clip(store.getItem(k)), (store.getItem(k) || '').length]);
+            }
+        } catch (e) { return {error: String(e)}; }
+        return out;
+    };
+    const res = {origin: location.origin};
+    // The storage getters themselves throw on opaque/sandboxed origins.
+    if (kind === 'all' || kind === 'local') { try { res.local = dump(localStorage); } catch (e) { res.local = {error: String(e)}; } }
+    if (kind === 'all' || kind === 'session') { try { res.session = dump(sessionStorage); } catch (e) { res.session = {error: String(e)}; } }
+    if (kind === 'all' || kind === 'indexeddb') {
+        try {
+            res.indexeddb = (indexedDB.databases ? await indexedDB.databases() : []).map(d => d.name + (d.version ? ' (v' + d.version + ')' : ''));
+        } catch (e) { res.indexeddb = {error: String(e)}; }
+    }
+    if (kind === 'all' || kind === 'cache') {
+        try { res.cache = self.caches ? await caches.keys() : {error: 'unavailable (insecure context)'}; } catch (e) { res.cache = {error: String(e)}; }
+    }
+    return res;
+}
+"""
+
 _GET_TEXT_JS = """
 () => {
     // Try to find the main article content
@@ -355,6 +493,12 @@ class BrowserManager:
             print("[openeyes-web] Invalid OPENEYES_WEB_MAX_TABS; using 20", file=sys.stderr)
         self._ensure_lock = asyncio.Lock()
         self._chrome_pid: int | None = None  # PID of Chrome we launched (None if we reused an existing one)
+        # Opt-in console/network capture. Listeners are attached only while it's
+        # on: Playwright subscribes the Node driver to console/request/response
+        # events on the first listener, so an always-on listener would have every
+        # request and console line serialized to Python even when nobody reads it.
+        self.devtools = DevToolsRecorder()
+        self._dt_listeners: dict[int, list[tuple[str, object]]] = {}  # id(page) -> [(event, fn)]
 
     async def _ensure_browser(self) -> Page:
         async with self._ensure_lock:
@@ -543,6 +687,61 @@ class BrowserManager:
         page.on("close", lambda: self._forget_page(page))
         page.on("framenavigated", lambda frame, p=page: self._on_frame_nav(p, frame))
         page.on("dialog", lambda d: asyncio.ensure_future(self._handle_dialog(d)))
+        self.devtools.on_navigated(id(page), page.url)
+        if self.devtools.enabled:
+            self._attach_devtools(page)
+
+    # --- DevTools recording (opt-in) ---
+
+    def set_devtools(self, enabled: bool) -> None:
+        """Turn console/network recording on or off for every open tab."""
+        if enabled:
+            self.devtools.enable()
+            for page in self._pages:
+                self._attach_devtools(page)
+        else:
+            for page in list(self._pages):
+                self._detach_devtools(page)
+            self.devtools.disable()
+
+    def _attach_devtools(self, page: Page) -> None:
+        """Feed this page's console + network events to the recorder."""
+        key = id(page)
+        if key in self._dt_listeners:
+            return
+        dt = self.devtools
+
+        def on_console(msg):
+            loc = ""
+            try:
+                l = msg.location or {}
+                if l.get("url"):
+                    name = l["url"].rsplit("/", 1)[-1].split("?", 1)[0] or "(page)"
+                    loc = f"{name[:60]}:{l.get('lineNumber', 0)}"
+            except Exception:
+                pass
+            dt.on_console(key, msg.type, msg.text, loc)
+
+        listeners = [
+            ("console", on_console),
+            ("pageerror", lambda err: dt.on_page_error(key, getattr(err, "message", str(err)))),
+            ("request", lambda req: dt.on_request(key, req)),
+            ("response", lambda resp: dt.on_response(key, resp)),
+            ("requestfinished", lambda req: dt.on_request_finished(key, req)),
+            ("requestfailed", lambda req: dt.on_request_failed(key, req)),
+        ]
+        for event, fn in listeners:
+            page.on(event, fn)
+        self._dt_listeners[key] = listeners
+
+    def _detach_devtools(self, page: Page) -> None:
+        """Remove the recorder's listeners — Playwright unsubscribes the driver
+        once the last listener for an event is gone."""
+        for event, fn in self._dt_listeners.pop(id(page), []):
+            try:
+                page.remove_listener(event, fn)
+            except Exception:
+                pass
 
     async def _handle_dialog(self, dialog) -> None:
         """Keep JS dialogs from blocking the page. Accept beforeunload (so navigation
@@ -556,12 +755,13 @@ class BrowserManager:
             pass
 
     def _on_frame_nav(self, page: Page, frame) -> None:
-        if self._device == "desktop":
-            return
         try:
             if frame is not page.main_frame:
                 return
         except Exception:
+            return
+        self.devtools.on_navigated(id(page), page.url)
+        if self._device == "desktop":
             return
         asyncio.ensure_future(self._apply_device(page))
 
@@ -589,6 +789,8 @@ class BrowserManager:
 
     def _forget_page(self, page: Page) -> None:
         self._cdp_sessions.pop(id(page), None)
+        self._dt_listeners.pop(id(page), None)
+        self.devtools.forget_tab(id(page))
         if page not in self._pages:
             return  # already removed by close_tab()
         i = self._pages.index(page)
@@ -954,6 +1156,85 @@ class BrowserManager:
     async def get_page_title(self) -> str:
         page = await self._ensure_browser()
         return await page.title()
+
+    # --- DevTools-style inspection (Elements / Sources / Application) ---
+
+    async def inspect_element(self, x: int | None = None, y: int | None = None,
+                              selector: str = "", html_limit: int = 2000) -> dict:
+        """Describe the element at viewport (x, y) or the first match of a CSS selector."""
+        page = await self._ensure_browser()
+        return await page.evaluate(_INSPECT_JS, {"x": x, "y": y, "selector": selector or "",
+                                                 "htmlLimit": html_limit})
+
+    async def get_storage(self, kind: str = "all", contains: str = "", value_limit: int = 300) -> dict:
+        """localStorage / sessionStorage / IndexedDB names / Cache names for the
+        active tab's origin, plus cookies visible to its URL."""
+        page = await self._ensure_browser()
+        res = await page.evaluate(_STORAGE_JS, {"kind": kind, "contains": contains,
+                                                "valueLimit": value_limit})
+        if kind in ("all", "cookies"):
+            try:
+                cookies = await self._context.cookies(page.url)
+            except Exception as e:
+                cookies = []
+                res["cookies_error"] = str(e).split("\n", 1)[0]
+            needle = (contains or "").lower()
+            res["cookies"] = [c for c in cookies if not needle or needle in c.get("name", "").lower()]
+        return res
+
+    async def page_html(self) -> str:
+        page = await self._ensure_browser()
+        return await page.content()
+
+    async def list_resources(self) -> list[dict]:
+        """Loaded resources of the active tab (what the Sources panel lists)."""
+        page = await self._ensure_browser()
+        cdp = await self._cdp_for(page)
+        tree = await cdp.send("Page.getResourceTree")
+        out = []
+
+        def walk(frame_tree):
+            frame = frame_tree["frame"]
+            out.append({"url": frame["url"], "type": "Document", "mime": frame.get("mimeType", ""),
+                        "frame": frame["id"], "size": None})
+            for r in frame_tree.get("resources", []):
+                out.append({"url": r["url"], "type": r["type"], "mime": r.get("mimeType", ""),
+                            "frame": frame["id"], "size": r.get("contentSize")})
+            for child in frame_tree.get("childFrames", []):
+                walk(child)
+        walk(tree["frameTree"])
+        return out
+
+    async def get_resource(self, url: str) -> tuple[dict | None, str | None, list[dict]]:
+        """Content of one loaded resource by URL substring. Returns
+        (match, content, candidates) — content None when no single match."""
+        resources = await self.list_resources()
+        needle = url.lower()
+        hits = [r for r in resources if needle in r["url"].lower()]
+        exact = [r for r in hits if r["url"].lower() == needle]
+        if len(hits) != 1 and len(exact) != 1:
+            return None, None, hits
+        match = exact[0] if exact else hits[0]
+        if match["type"] in _BINARY_RESOURCE_TYPES or (match.get("mime") or "").split("/")[0] in ("image", "font", "audio", "video"):
+            size = f" ({match['size']:.0f} bytes)" if match.get("size") else ""
+            return match, f"[binary {match['type']} resource{size} — not shown]", hits
+        page = await self._ensure_browser()
+        cdp = await self._cdp_for(page)
+        # getResourceContent needs the Page agent; turn it off again so this
+        # persistent per-tab session doesn't keep receiving Page.* events.
+        await cdp.send("Page.enable")
+        try:
+            res = await cdp.send("Page.getResourceContent", {"frameId": match["frame"], "url": match["url"]})
+        finally:
+            try:
+                await cdp.send("Page.disable")
+            except Exception:
+                pass
+        content = res.get("content", "")
+        if res.get("base64Encoded"):
+            import base64
+            content = base64.b64decode(content).decode("utf-8", errors="replace")
+        return match, content, hits
 
     async def close(self, kill_chrome: bool = False) -> None:
         """Disconnect from browser. By default Chrome/Xvfb persist; pass
