@@ -180,8 +180,8 @@ Works with any MCP-compatible agent. The 20 tools appear automatically after con
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENEYES_WEB_CDP_PORT` | `9222` | Chrome DevTools Protocol port. Use different ports for multi-agent isolation. |
-| `OPENEYES_WEB_SESSION` | `default` | Session name for token tracking. Keeps per-agent stats separate. |
+| `OPENEYES_WEB_CDP_PORT` | `9222` | Starting port for automatic Chrome port allocation; occupied/reserved ports are skipped. |
+| `OPENEYES_WEB_SESSION` | automatic | Optional persistent identity. Without it, each stdio MCP process gets a unique browser, including agents in the same worktree. Never set one global value for all agents. An OS ownership lock rejects a second MCP process using the same explicit identity. The legacy global `pi-openeyes` value is ignored so cached Pi configurations also reconnect safely. |
 | `OPENEYES_WEB_MODEL` | `unknown` | Model name for cost tracking. Also settable via `set_model()` tool. |
 | `FASTMCP_PORT` | `6090` | Port for SSE/HTTP transport (non-stdio mode). |
 

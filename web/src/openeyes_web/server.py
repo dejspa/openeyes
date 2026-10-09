@@ -20,6 +20,7 @@ import stat
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 
 from mcp.server.fastmcp import FastMCP, Context, Image as MCPImage
@@ -143,50 +144,19 @@ _cleanup_started = False
 _TOKEN_LOG = os.path.expanduser("~/.openeyes/web/token-log.jsonl")
 _HISTORY_ROOT = os.path.expanduser("~/.openeyes/web/history")
 
-# In stdio mode every client gets its own server process, so the client is
-# identifiable — but not by our own cwd: the launcher is typically
-# "uv run --directory <openeyes>", which puts every instance in the SAME
-# directory. Walk up to the process that actually spawned us (the agent) and
-# key on ITS working directory instead. Without this, all Claude Code agents
-# on a machine report the same clientInfo.name ("claude-code"), land on one
-# session and share ONE Chrome — their calls then serialize behind each other
-# until they time out (two QA runs lost this way on 2026-08-04).
-# The agent's cwd is stable across reconnections, so it keeps its own cookies
-# and logged-in state. SSE mode keeps the old behaviour: one shared server
-# process means the parent says nothing about who is calling.
+# Each stdio MCP server owns a fresh browser identity, even when agents share
+# a worktree. Explicit session IDs support sequential reconnects, not concurrent
+# ownership. Shared transports retain their client-provided identities.
 _SHARED_TRANSPORT = (len(sys.argv) > 1 and sys.argv[1] in ("sse", "serve", "http"))
-_LAUNCHER_COMMS = {"uv", "uvx", "python", "python3", "sh", "bash", "zsh", "dash", "env"}
-
-
-def _client_key() -> str:
-    """Identify the process that launched this server: its cwd, else its pid."""
-    try:
-        pid = os.getppid()
-        for _ in range(6):
-            if pid <= 1:
-                break
-            with open(f"/proc/{pid}/comm") as f:
-                comm = f.read().strip()
-            if comm not in _LAUNCHER_COMMS:
-                try:
-                    return os.readlink(f"/proc/{pid}/cwd")
-                except OSError:
-                    return f"pid{pid}"
-            with open(f"/proc/{pid}/stat") as f:
-                pid = int(f.read().rsplit(")", 1)[1].split()[1])  # ppid
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        return os.getcwd()
-    except OSError:
-        return ""
+# A worktree is not an agent identity: parent and subagents often share it.
+_INSTANCE_ID = uuid.uuid4().hex
+_session_owner_fds: dict[str, int] = {}
 
 
 def _instance_suffix() -> str:
     if _SHARED_TRANSPORT:
         return ""
-    key = _client_key()
-    return "-" + hashlib.sha1(key.encode()).hexdigest()[:8] if key else ""
+    return "-" + _INSTANCE_ID
 
 
 def _bg(fn) -> None:
@@ -200,17 +170,16 @@ def _bg(fn) -> None:
 def _session_id(ctx: Context | None) -> str:
     """Resolve session ID from MCP context.
 
-    Uses the client-provided name from InitializeRequest (e.g. 'claude-code')
-    plus, in stdio mode, a short hash of the working directory — the client
-    name alone is the same for every Claude Code agent on the machine, so it
-    identifies the *program*, not the caller. The pair is stable across
-    reconnections, so an agent keeps its own Chrome, cookies and logged-in
-    state, while two agents never land on the same browser.
-    Set OPENEYES_WEB_SESSION to pin a session explicitly (amux does this per
-    tmux session, which also gives sibling agents in one worktree their own).
+    In stdio mode, client name plus a random process-instance ID isolates
+    even agents in the same worktree. It stays stable for this MCP process,
+    but restarting without an explicit ID intentionally creates a fresh browser.
+    OPENEYES_WEB_SESSION explicitly opts into a persistent identity; only one
+    server process may own it at a time (enforced during port allocation).
     """
     override = os.environ.get("OPENEYES_WEB_SESSION")
-    if override:
+    # Older Pi clients cache this global value even after mcp.json is updated.
+    # It never identified an agent; retire it so reconnects isolate immediately.
+    if override and override != "pi-openeyes":
         return override
     if ctx is not None:
         sess = getattr(ctx, "session", None)
@@ -333,11 +302,32 @@ def _port_listening(port: int) -> bool:
         probe.close()
 
 
+def _claim_session(session_id: str) -> None:
+    """Hold an OS lease for this process; never silently share another owner."""
+    if session_id in _session_owner_fds:
+        return
+    digest = hashlib.sha256(session_id.encode()).hexdigest()
+    path = f"/tmp/openeyes-web-owner-{os.geteuid()}-{digest}.lock"
+    fd = _open_owned_regular(path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise RuntimeError(
+            "OpenEyes session is already owned by another MCP process. "
+            "Remove the shared OPENEYES_WEB_SESSION or use a unique session ID."
+        ) from exc
+    # Keep the descriptor open until process exit. Do not unlink the lock file:
+    # a replacement inode would allow a second process to bypass the lease.
+    _session_owner_fds[session_id] = fd
+
+
 def _allocate_port(session_id: str) -> int:
     """Return a CDP port for this session, allocating a fresh one if needed.
 
     The reservation is persisted immediately under the file lock so two MCP
     processes can't hand out the same port concurrently."""
+    _claim_session(session_id)
     if session_id in _session_ports:
         return _session_ports[session_id]
     with _session_lock():
