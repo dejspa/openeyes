@@ -205,6 +205,66 @@ class RecorderCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GET /app/api/x → 200 (json, 2.0KB,", line)
 
 
+    async def test_empty_no_content_responses_keep_the_observed_status(self):
+        for status in (204, 205):
+            with self.subTest(status=status):
+                await self._roundtrip(FakeRequest("POST", PAGE + "/api/empty"),
+                                      status=status, headers={"content-length": "0"})
+                entry = self.dt.network_entries(TAB)[-1]
+                self.assertEqual(entry["resp_body"], "")
+                self.assertIn(f"→ {status} (", self.dt.format_network([entry]))
+                self.assertIn(f"Result: {status} ", self.dt.format_request(entry))
+
+    async def test_body_fetch_failure_preserves_the_observed_status(self):
+        from unittest.mock import AsyncMock
+
+        req = FakeRequest("POST", PAGE + "/api/body")
+        self.dt.on_request(TAB, req)
+        resp = FakeResponse(req, status=204)
+        resp.body = AsyncMock(side_effect=RuntimeError("body fetch failed"))
+        self.dt.on_response(TAB, resp)
+        self.dt.on_request_finished(TAB, req)
+        await _drain()
+        entry = self.dt.network_entries(TAB)[0]
+        self.assertIn("→ 204 (", self.dt.format_network([entry]))
+        detail = self.dt.format_request(entry)
+        self.assertIn("Result: 204 ", detail)
+        self.assertIn("[body unavailable: body fetch failed]", detail)
+
+    async def test_no_response_does_not_infer_status_from_headers_or_empty_body(self):
+        req = FakeRequest("POST", PAGE + "/api/unknown", failure="net::ERR_ABORTED")
+        self.dt.on_request(TAB, req)
+        entry = self.dt.network_entries(TAB)[0]
+        # Even partial header/body evidence must not be treated as an HTTP status.
+        entry.update(resp_headers={"content-length": "0"}, resp_body="")
+        self.assertIn("→ … pending", self.dt.format_network([entry]))
+        self.assertIn("Result: pending (no response yet)", self.dt.format_request(entry))
+        self.dt.on_request_failed(TAB, req)
+        self.assertIsNone(entry["status"])
+        self.assertIn("→ ✗ net::ERR_ABORTED", self.dt.format_network([entry]))
+        self.assertIn("Result: FAILED — net::ERR_ABORTED", self.dt.format_request(entry))
+        for text in (self.dt.format_network([entry]), self.dt.format_request(entry)):
+            self.assertNotIn("204", text)
+            self.assertNotIn("205", text)
+
+    async def test_response_then_abort_shows_status_and_transport_error(self):
+        req = FakeRequest("POST", PAGE + "/api/abort", failure="net::ERR_ABORTED")
+        self.dt.on_request(TAB, req)
+        self.dt.on_response(TAB, FakeResponse(req, status=204, status_text="No Content",
+                                             headers={"content-length": "0"}))
+        self.dt.on_request_failed(TAB, req)
+        await _drain()
+        entry = self.dt.network_entries(TAB, types="failed")[0]
+        self.assertEqual(entry["status"], 204)
+        self.assertEqual(entry["error"], "net::ERR_ABORTED")
+        with self.subTest(format="network"):
+            self.assertIn("→ 204 ✗ net::ERR_ABORTED", self.dt.format_network([entry]))
+        for include_headers in (True, False):
+            with self.subTest(include_headers=include_headers):
+                detail = self.dt.format_request(entry, include_headers=include_headers)
+                self.assertIn("Result: 204 No Content", detail)
+                self.assertIn("FAILED — net::ERR_ABORTED", detail)
+
     async def test_forget_tab_purges_its_entries(self):
         self.dt.on_console(TAB, "log", "mine")
         self.dt.on_console(2, "log", "other")

@@ -430,7 +430,8 @@ class DevToolsRecorder:
             if len(url) > 100:
                 url = url[:97] + "…"
             if e["error"]:
-                result = f"✗ {e['error']}"
+                status = f"{e['status']} " if e["status"] is not None else ""
+                result = f"{status}✗ {e['error']}"
             elif e["status"] is None:
                 result = "… pending"
             else:
@@ -448,7 +449,9 @@ class DevToolsRecorder:
         out = [f"#{e['seq']} {e['method']} {e['url']}",
                f"Type: {e['type']}  Time: {e['ts']}" + (f"  Duration: {e['ms']}ms" if e["ms"] is not None else "")]
         if e["error"]:
-            out.append(f"Result: FAILED — {e['error']}")
+            status = (f"{e['status']} {e['status_text']}".rstrip() + " — "
+                      if e["status"] is not None else "")
+            out.append(f"Result: {status}FAILED — {e['error']}")
         elif e["status"] is None:
             out.append("Result: pending (no response yet)")
         else:
